@@ -5,7 +5,7 @@
 <key>CFBundleName</key><string>Codex Supervisor</string>
 <key>CFBundleDisplayName</key><string>Codex Supervisor</string>
 <key>CFBundleExecutable</key><string>CodexPacerIsland</string>
-<key>CFBundleIconFile</key><string>Pacer.icns</string>
+<key>CFBundleIconFile</key><string>Supervisor.icns</string>
 <key>CFBundleDevelopmentRegion</key><string>en</string>
 <key>CFBundleLocalizations</key><array><string>en</string><string>zh-Hans</string></array>
 <key>CFBundlePackageType</key><string>APPL</string>
