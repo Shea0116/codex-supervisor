@@ -20,8 +20,9 @@ import SwiftUI
 
     var body: some View {
         Group {
-            if let image = (outline ? Self.outlines : Self.images)[provider] {
-                Image(nsImage: image).renderingMode(outline ? .template : .original)
+            let template = outline ? Self.outlines[provider] : nil
+            if let image = template ?? Self.images[provider] {
+                Image(nsImage: image).renderingMode(template == nil ? .original : .template)
                     .resizable().interpolation(.high).scaledToFit()
             } else if outline {
                 Image(systemName: provider.glyph).font(.system(size: size * 0.7, weight: .medium))

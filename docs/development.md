@@ -92,7 +92,9 @@ The task header shows an app button for each enabled module whose desktop app re
 
 Both hosts load the provider app icons from the same `PacerCore/Resources/provider-*.png` files. The Codex and Claude artwork comes from their desktop distributions. The DeepSeek and WorkBuddy images come from the icons embedded in their Windows executables. [Codex](https://openai.com/index/introducing-the-codex-app/) · [Claude](https://claude.com/download) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/desktop/README.md) · [WorkBuddy](https://cloud.tencent.com/act/pro/workbuddy)
 
-The expanded island's app buttons and their More menu entries use the transparent `provider-*-outline.png` files. ImageGen generated these from the public app icons. The strokes follow each control's foreground color.
+Cursor, Grok Bot and Muse use icons from their macOS application bundles. Antigravity uses Google's full-color icon. [Antigravity press assets](https://antigravity.google/press)
+
+The expanded island's app buttons and their More menu entries use the transparent `provider-*-outline.png` files where available. Other services use their full-color icon at the same size.
 
 ### Model and reasoning effort
 
