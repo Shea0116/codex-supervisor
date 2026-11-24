@@ -1,0 +1,36 @@
+import Foundation
+
+public struct RuntimeStreamStatus: Equatable, Sendable {
+    public var connected = false
+    public var sourceName: String?
+    public var remoteHostOnline: Bool?
+    /// Nil means no source-availability evidence. False distinguishes a
+    /// reachable host with a missing provider home from a transport failure.
+    public var sourceAvailable: Bool?
+    /// The Desktop observer is ready, but this Remote Control host has no
+    /// loaded runtime session. This is idle, not a failed connection.
+    public var waitingForSession = false
+    public var hasConnectionFailure: Bool { !connected && !waitingForSession && sourceAvailable != false && remoteHostOnline != false }
+    public var attachedThreads = 0
+    public var notifications = 0
+    public var fallbackScans = 0
+    public var watchingLogs = false
+    public var helperCpuSeconds = 0.0
+    public var helperLoopIterations = 0
+    /// Claude: this source has delivered an exact request span, so Pacer's
+    /// request telemetry reaches it whatever its settings say.
+    public var exactRequestSpans = false
+    public init() {}
+
+    /// Equal apart from the diagnostic counters (`notifications`,
+    /// `fallbackScans` and the helper's CPU and loop counts), which only feed
+    /// runtime traces. A heartbeat that changes only those is not news.
+    public func sameState(as other: RuntimeStreamStatus) -> Bool {
+        var lhs = self, rhs = other
+        lhs.clearDiagnostics(); rhs.clearDiagnostics()
+        return lhs == rhs
+    }
+    private mutating func clearDiagnostics() {
+        notifications = 0; fallbackScans = 0; helperCpuSeconds = 0; helperLoopIterations = 0
+    }
+}

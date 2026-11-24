@@ -1,0 +1,336 @@
+#if canImport(PacerMacSupport)
+import PacerMacSupport
+#else
+@testable import PacerEngineSupport
+#endif
+import XCTest
+import SQLite3
+@testable import PacerCore
+
+final class SourceDiscoveryTests: XCTestCase {
+    func testLongRolloutRecoversItsMatchingTurnModel() async throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let now = Date(), formatter = DateFormatter(); formatter.dateFormat = "yyyy/MM/dd"
+        let day = home.appendingPathComponent("sessions/" + formatter.string(from: now))
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let id = UUID().uuidString.lowercased(), file = day.appendingPathComponent("rollout-" + id + ".jsonl")
+        var bytes = try record("session_meta", payload: ["id": id], at: now)
+        bytes += try record("event_msg", payload: ["type": "task_started", "turn_id": "turn"], at: now)
+        bytes += try record("turn_context", payload: ["turn_id": "turn", "model": "gpt-fixture", "effort": NSNull()], at: now)
+        bytes += try record("ignored", payload: ["padding": String(repeating: "x", count: 600_000)], at: now)
+        try bytes.write(to: file)
+        try CodexHookFixture.announceAll(home: home, at: now)
+        let result = await LocalActivityReader().read(home: home, now: now)
+        XCTAssertEqual(result.activities.first?.turnID, "turn")
+        XCTAssertEqual(result.activities.first?.modelName, "gpt-fixture")
+        XCTAssertNil(result.activities.first?.reasoningEffort)
+    }
+
+    func testRemovedRunningLogBecomesUnconfirmedAndFreesItsCursor() async throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let now = Date(), formatter = DateFormatter(); formatter.dateFormat = "yyyy/MM/dd"
+        let day = home.appendingPathComponent("sessions/" + formatter.string(from: now))
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("rollout-" + UUID().uuidString + ".jsonl")
+        try record("event_msg", payload: ["type": "task_started", "turn_id": "turn"], at: now).write(to: file)
+        let reader = LocalActivityReader()
+        try CodexHookFixture.announceAll(home: home, at: now)
+        let first = await reader.read(home: home, now: now)
+        XCTAssertEqual(first.activities.first?.phase, .running)
+        try FileManager.default.removeItem(at: file)
+        try CodexHookFixture.announceAll(home: home, at: now.addingTimeInterval(3600))
+        let lost = await reader.read(home: home, now: now.addingTimeInterval(3600))
+        XCTAssertEqual(lost.activities.first?.phase, .unknown)
+        try CodexHookFixture.announceAll(home: home, at: now.addingTimeInterval(3601))
+        let next = await reader.read(home: home, now: now.addingTimeInterval(3601))
+        XCTAssertTrue(next.activities.isEmpty)
+    }
+    private func temp() throws -> URL {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        return home
+    }
+    private func database(home: URL, rollout: URL) throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(home.appendingPathComponent("state_5.sqlite").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE threads (rollout_path TEXT, archived INTEGER, recency_at_ms INTEGER, thread_source TEXT, model TEXT, title TEXT)", nil, nil, nil), SQLITE_OK)
+        let path = rollout.path.replacingOccurrences(of: "'", with: "''")
+        XCTAssertEqual(sqlite3_exec(db, "INSERT INTO threads VALUES ('\(path)',0,123,'user','gpt-test','Resumed analysis')", nil, nil, nil), SQLITE_OK)
+    }
+    private func record(_ type: String, payload: [String: Any], at date: Date) throws -> Data {
+        let f = ISO8601DateFormatter()
+        return try JSONSerialization.data(withJSONObject: ["timestamp":f.string(from: date),"type":type,"payload":payload]) + Data([10])
+    }
+    func testOldDateResumedSessionIsFoundThroughReadOnlyIndex() async throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let day = home.appendingPathComponent("sessions/2025/01/01")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("resumed.jsonl")
+        let now = Date()
+        try record("event_msg", payload: ["type":"task_started","turn_id":"resumed"], at: now).write(to: file)
+        try database(home: home, rollout: file)
+        try CodexHookFixture.announceAll(home: home, at: now)
+        let result = await LocalActivityReader().read(home: home, now: now)
+        XCTAssertEqual(result.activities.first?.phase, .running)
+        XCTAssertEqual(result.activities.first?.title, "Resumed analysis")
+        XCTAssertTrue(result.watchURLs.contains { $0.standardizedFileURL.path == day.standardizedFileURL.path })
+    }
+    /// Codex can index a Windows rollout as `\\?\C:\...` (#276). The index reads it as
+    /// the hooks do, so a session resumed from an older day folder keeps Codex's title;
+    /// a row outside the home's rollout trees, or one Windows would read differently, is not used.
+    func testTheIndexReadsAWindowsExtendedPathAsTheHooksDo() async throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        try XCTSkipUnless(CodexHookSpool.windowsComponents(home.standardizedFileURL.path) != nil, "Windows paths only")
+        func native(_ url: URL) -> String {
+            var path = url.standardizedFileURL.path
+            if path.hasPrefix("/"), path.dropFirst().dropFirst().first == ":" { path.removeFirst() }
+            return path.replacingOccurrences(of: "/", with: "\\")
+        }
+        let day = home.appendingPathComponent("sessions/2025/01/01")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let now = Date()
+        let drive = day.appendingPathComponent("rollout-2025-01-01T00-00-00-019a0000-0000-7000-8000-000000276001.jsonl")
+        let extended = day.appendingPathComponent("rollout-2025-01-01T00-00-00-019a0000-0000-7000-8000-000000276002.jsonl")
+        for (file, turn) in [(drive, "drive"), (extended, "extended")] {
+            try record("event_msg", payload: ["type": "task_started", "turn_id": turn], at: now).write(to: file)
+        }
+        let outside = home.appendingPathComponent("elsewhere.jsonl"); try Data().write(to: outside)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(home.appendingPathComponent("state_5.sqlite").path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE threads (rollout_path TEXT, archived INTEGER, recency_at_ms INTEGER, title TEXT)", nil, nil, nil), SQLITE_OK)
+        for (path, title) in [(native(drive), "Drive path"), (#"\\?\"# + native(extended), "Extended path"),
+                              (#"\\?\"# + native(outside), "Outside the rollout trees"),
+                              (#"\\?\"# + native(day) + #"\..\01\"# + extended.lastPathComponent, "Dot segment"),
+                              (#"\\?\"# + native(extended) + ":stream", "Alternate stream")] {
+            let row = "INSERT INTO threads VALUES ('\(path.replacingOccurrences(of: "'", with: "''"))',0,123,'\(title)')"
+            XCTAssertEqual(sqlite3_exec(db, row, nil, nil, nil), SQLITE_OK)
+        }
+        sqlite3_close(db)
+        XCTAssertEqual(Set(SessionIndex.entries(home: home).compactMap(\.title)), ["Drive path", "Extended path"],
+                       "Both spellings of a rollout in the sessions tree count; nothing else does")
+        try CodexHookFixture.announce([drive, extended], home: home, at: now)
+        let result = await LocalActivityReader().read(home: home, now: now)
+        XCTAssertEqual(Set(result.activities.compactMap(\.title)), ["Drive path", "Extended path"],
+                       "The task Codex indexed with \\\\?\\ keeps its title instead of the project's name")
+    }
+    func testAssignedConversationNameTakesPrecedenceOverOriginalPromptTitle() async throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let day = home.appendingPathComponent("sessions/2025/01/01")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("named.jsonl")
+        let now = Date()
+        try record("event_msg", payload: ["type":"task_started","turn_id":"named"], at: now).write(to: file)
+        try database(home: home, rollout: file)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(home.appendingPathComponent("state_5.sqlite").path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "ALTER TABLE threads ADD COLUMN name TEXT", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "UPDATE threads SET name='Assigned conversation'", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        try CodexHookFixture.announceAll(home: home, at: now)
+        let result = await LocalActivityReader().read(home: home, now: now)
+        XCTAssertEqual(result.activities.first?.title, "Assigned conversation")
+    }
+    func testANameCodexAssignsWhileTheTaskRunsShowsWithinFiveSeconds() async throws {
+        // Codex Desktop starts a chat in a folder named from its first words
+        // ("zhi-zuo") and names it 11 s later; the reads in between are metrics-only.
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let now = Date(), formatter = DateFormatter(); formatter.dateFormat = "yyyy/MM/dd"
+        let day = home.appendingPathComponent("sessions/" + formatter.string(from: now))
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("rollout-" + UUID().uuidString.lowercased() + ".jsonl")
+        try record("event_msg", payload: ["type": "task_started", "turn_id": "named-later"], at: now).write(to: file)
+        try database(home: home, rollout: file)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(home.appendingPathComponent("state_5.sqlite").path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "ALTER TABLE threads ADD COLUMN name TEXT; UPDATE threads SET title=NULL", nil, nil, nil), SQLITE_OK)
+        let reader = LocalActivityReader()
+        try CodexHookFixture.announceAll(home: home, at: now)
+        let started = await reader.read(home: home, now: now)
+        XCTAssertNil(started.activities.first?.title)
+        XCTAssertEqual(sqlite3_exec(db, "UPDATE threads SET name='Random number generator'", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        try CodexHookFixture.announceAll(home: home, at: now.addingTimeInterval(1))
+        let soon = await reader.read(home: home, now: now.addingTimeInterval(1), metricsOnly: true)
+        XCTAssertNil(soon.activities.first?.title, "Metrics-only reads reread names at most every five seconds")
+        try CodexHookFixture.announceAll(home: home, at: now.addingTimeInterval(6))
+        let named = await reader.read(home: home, now: now.addingTimeInterval(6), metricsOnly: true)
+        XCTAssertEqual(named.activities.first?.title, "Random number generator")
+    }
+    func testIndexCannotReadPathsOutsideSelectedCodexHome() throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let outside = home.appendingPathComponent("private.jsonl")
+        try Data().write(to: outside)
+        try database(home: home, rollout: outside)
+        XCTAssertTrue(SessionIndex.files(home: home).isEmpty)
+    }
+    func testRemoteDiscoveryOnlyUsesEnabledConfiguredSafeSshAliases() throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let state: [String:Any] = [
+            "codex-managed-remote-connections":[
+                ["hostId":"remote-ssh-discovered:one","displayName":"one","source":"discovered","alias":"one"],
+                ["hostId":"remote-ssh-discovered:unsafe","displayName":"unsafe","source":"discovered","alias":"-oProxyCommand=bad"],
+                ["hostId":"remote-ssh-discovered:off","displayName":"off","source":"discovered","alias":"off"]],
+            "remote-connection-auto-connect-by-host-id":["remote-ssh-discovered:one":true,"remote-ssh-discovered:unsafe":true,"remote-ssh-discovered:off":false]]
+        try JSONSerialization.data(withJSONObject:state).write(to:home.appendingPathComponent(".codex-global-state.json"))
+        XCTAssertEqual(RemoteActivityTarget.configured(home:home).map(\.alias), ["one"])
+    }
+    func testSSHDiscoveryFollowsTheCurrentDesktopAccount() throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let file = home.appendingPathComponent(".codex-global-state.json")
+        let first = String(repeating: "a", count: 64), second = String(repeating: "b", count: 64)
+        let one = "remote-ssh-discovered:one", two = "remote-ssh-discovered:two"
+        let flags = "remote-connection-auto-connect-by-host-id"
+        let routes = "app-server-migrated-pinned-thread-ids-by-host"
+        let owner = "electron-renderer-content-owner"
+        var state: [String: Any] = [
+            "codex-managed-remote-connections": [
+                ["hostId": one, "source": "discovered", "alias": "one"],
+                ["hostId": two, "source": "discovered", "alias": "two"]],
+            flags: [one: true, two: true],
+            routes: [two + ":/legacy/codex": [] as [String]],
+            "electron-account-remote-preference:\(flags):\(first)": [one: true, two: false],
+            "electron-account-remote-preference:\(flags):\(second)": [one: false, two: true],
+            "electron-owner-value:\(routes):\(first)": [
+                one + ":/srv/first/codex": [] as [String], two + ":/srv/first/other": [] as [String]]
+        ]
+        func write(ownerValue: String) throws {
+            state[owner] = ownerValue
+            try JSONSerialization.data(withJSONObject: state).write(to: file, options: .atomic)
+        }
+        try write(ownerValue: first)
+        var targets = RemoteActivityTarget.configured(home: home)
+        XCTAssertEqual(targets.map(\.alias), ["one"])
+        XCTAssertEqual(targets.map(\.home), ["/srv/first/codex"])
+
+        try write(ownerValue: second)
+        targets = RemoteActivityTarget.configured(home: home)
+        XCTAssertEqual(targets.map(\.alias), ["two"])
+        XCTAssertEqual(targets.map(\.home), ["~/.codex"])
+
+        try write(ownerValue: String(repeating: "c", count: 64))
+        XCTAssertTrue(RemoteActivityTarget.configured(home: home).isEmpty)
+
+        try write(ownerValue: "signed-out")
+        XCTAssertTrue(RemoteActivityTarget.configured(home: home).isEmpty)
+    }
+
+    func testCodexManagedSSHUsesTheSavedRouteAndCurrentAccount() throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let owner = String(repeating: "a", count: 64)
+        let legacy = "remote-ssh-discovered:alias"
+        let id = "remote-ssh-codex-managed:019a0000-0000-7000-8000-000000000001"
+        let off = "remote-ssh-codex-managed:off"
+        let malformed = "remote-ssh-codex-managed:malformed"
+        let noOptions = "remote-ssh-codex-managed:defaults"
+        let flags = "remote-connection-auto-connect-by-host-id"
+        let routes = "app-server-migrated-pinned-thread-ids-by-host"
+        let managed: [String: Any] = ["hostId": id, "source": "codex-managed", "alias": NSNull(),
+            "displayName": "Build server", "hostname": "fixture@build.example.test", "sshPort": 2222, "identity": "~/fixture key"]
+        let other: [[String: Any]] = [
+            ["hostId": off, "source": "codex-managed", "hostname": "off.example.test"],
+            ["hostId": malformed, "source": "codex-managed", "hostname": "bad.example.test", "sshPort": 65536],
+            ["hostId": noOptions, "source": "codex-managed", "hostname": "default.example.test", "sshPort": NSNull(), "identity": NSNull()],
+            ["hostId": legacy, "source": "discovered", "alias": "alias"]]
+        let state: [String: Any] = [
+            "codex-managed-remote-connections": [managed, managed] + other,
+            "electron-renderer-content-owner": owner,
+            flags: [id: false, off: true],
+            "electron-account-remote-preference:\(flags):\(owner)": [legacy: true, id: true, malformed: true, noOptions: true],
+            "electron-owner-value:\(routes):\(owner)": [id + ":/srv/codex": [] as [String]]]
+        try JSONSerialization.data(withJSONObject: state).write(to: home.appendingPathComponent(".codex-global-state.json"))
+
+        let targets = RemoteActivityTarget.configured(home: home)
+        XCTAssertEqual(targets.map(\.id), [legacy, id, noOptions])
+        let routed = try XCTUnwrap(targets.first { $0.id == id })
+        XCTAssertEqual(routed.name, "Build server")
+        XCTAssertEqual(routed.home, "/srv/codex")
+        XCTAssertEqual(routed.sshIdentityFile, "~/fixture key")
+        let arguments = try XCTUnwrap(routed.sshArguments())
+        XCTAssertEqual(Array(arguments.suffix(6)), ["-p", "2222", "-i", ("~/fixture key" as NSString).expandingTildeInPath,
+                                                   "--", "fixture@build.example.test"])
+        let defaults = try XCTUnwrap(targets.first { $0.id == noOptions })
+        XCTAssertNil(defaults.sshPort)
+        XCTAssertNil(defaults.sshIdentityFile)
+        XCTAssertEqual(defaults.home, "~/.codex")
+        let claude = RemoteActivityTarget.claudeCodexTargets(home: home)
+        XCTAssertEqual(claude.map(\.id), [legacy, id, noOptions], "Claude follows hosts added in Desktop too")
+        let claudeRoute = try XCTUnwrap(claude.first { $0.id == id })
+        XCTAssertEqual(claudeRoute.home, "~/.claude")
+        XCTAssertEqual(claudeRoute.sshArguments(), routed.sshArguments(), "Claude reaches the host by the same saved route")
+    }
+
+    func testSshAndRemoteControlDiscoveryShareOneScanAndFollowEachRewrite() throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let file = home.appendingPathComponent(".codex-global-state.json")
+        func write(_ rows: [Any], flag: Any, padding: Int) throws {
+            let state: [String: Any] = [
+                "codex-managed-remote-connections": rows,
+                "remote-connection-auto-connect-by-host-id": ["remote-ssh-discovered:one": flag],
+                "app-server-migrated-pinned-thread-ids-by-host": ["remote-ssh-discovered:one:/srv/codex": [], "remote-control:desk:/": []],
+                "thread-project-membership-host-ids": ["019a0000-0000-7000-8000-000000000001": "remote-control:laptop"],
+                "unrelated": String(repeating: "x", count: padding)]
+            try JSONSerialization.data(withJSONObject: state).write(to: file)
+        }
+        let row: [String: Any] = ["hostId": "remote-ssh-discovered:one", "displayName": "Build \"one\"", "source": "discovered", "alias": "one"]
+        try write([row], flag: true, padding: 1)
+        let ssh = try XCTUnwrap(RemoteActivityTarget.readConfiguration(home: home))
+        XCTAssertEqual(ssh.map(\.alias), ["one"]); XCTAssertEqual(ssh.first?.home, "/srv/codex"); XCTAssertEqual(ssh.first?.name, "Build \"one\"")
+        // A malformed row voids only the SSH list; a non-Boolean flag reads as off.
+        try write([row, "not an object"], flag: true, padding: 2)
+        XCTAssertNil(RemoteActivityTarget.readConfiguration(home: home))
+        try write([row], flag: 1, padding: 3)
+        XCTAssertEqual(RemoteActivityTarget.readConfiguration(home: home)?.count, 0)
+    }
+    func testLocalAndSshFreshRatesAggregateAndOldRatesRemainMarkedWithoutSelection() throws {
+        let start = Date(timeIntervalSince1970: 1000000)
+        var local = SessionActivity(id: "local")
+        var ssh = SessionActivity(id: "ssh", sourceHost: "one")
+        for (seconds, count) in [(0.0, 100), (2.0, 120)] {
+            if seconds == 0 {
+                local.consume(try record("event_msg", payload: ["type":"task_started","turn_id":"local"], at: start))
+                ssh.consume(try record("event_msg", payload: ["type":"task_started","turn_id":"ssh"], at: start))
+            }
+            local.consume(try record("event_msg", payload: ["type":"token_count","info":["total_token_usage":["output_tokens":count]]], at:start.addingTimeInterval(seconds)))
+            ssh.consume(try record("event_msg", payload: ["type":"token_count","info":["total_token_usage":["output_tokens":count * 2]]], at:start.addingTimeInterval(seconds)))
+        }
+        let fresh = ActivityOverview(activities: [local, ssh], at: start.addingTimeInterval(3))
+        XCTAssertEqual(fresh.displayedRate, 30)
+        XCTAssertTrue(fresh.rateIsFresh)
+        let overview = ActivityOverview(activities: [local, ssh], at:start.addingTimeInterval(60))
+        XCTAssertEqual(overview.running.count, 2)
+        XCTAssertEqual(overview.displayedRate, 30)
+        XCTAssertFalse(overview.rateIsFresh)
+        XCTAssertNil(overview.tokensPerSecond)
+    }
+    func testStaleStartupLogsCannotInventRunningTasks() async throws {
+        let home=try temp(); defer { try? FileManager.default.removeItem(at:home) }
+        let day=home.appendingPathComponent("sessions/2025/01/01")
+        try FileManager.default.createDirectory(at:day,withIntermediateDirectories:true)
+        let file=day.appendingPathComponent("old.jsonl")
+        let now=Date()
+        try record("event_msg",payload:["type":"task_started","turn_id":"old"],at:now.addingTimeInterval(-3600)).write(to:file)
+        try database(home:home,rollout:file)
+        let unnamed=await LocalActivityReader().read(home:home,now:now)
+        XCTAssertTrue(unnamed.activities.isEmpty, "A log no hook named is not followed")
+        // A start the hook saw an hour ago, then silence: the log alone cannot say it still runs.
+        try CodexHookFixture.announce([file], home: home, at: now.addingTimeInterval(-3600))
+        let named=await LocalActivityReader().read(home:home,now:now)
+        XCTAssertFalse(named.activities.contains { $0.phase == .running })
+    }
+    func testExperimentalTailKeepsCompleteRecentSamplesAfterPartialStartup() async throws {
+        let home = try temp(); defer { try? FileManager.default.removeItem(at: home) }
+        let now = Date(), day = home.appendingPathComponent("sessions/2025/01/01")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("rate.jsonl")
+        var bytes = try record("event_msg", payload: ["type":"task_started","turn_id":"rate"], at:now.addingTimeInterval(-20))
+        bytes += try record("response_item", payload: ["type":"message","role":"user","content":String(repeating:"padding",count:110000)], at:now.addingTimeInterval(-19))
+        for (seconds, count) in [(-10.0, 100), (-5.0, 200)] {
+            bytes += try record("event_msg", payload:["type":"token_count","info":["total_token_usage":["output_tokens":count]]], at:now.addingTimeInterval(seconds))
+        }
+        try bytes.write(to: file); try database(home: home, rollout: file)
+        try CodexHookFixture.announceAll(home: home, at: now)
+        let result = await LocalActivityReader().read(home: home, now: now, phaseAwareRate: true)
+        XCTAssertEqual(result.activities.first?.outputEstimate(at: now)?.value, 20)
+    }
+}

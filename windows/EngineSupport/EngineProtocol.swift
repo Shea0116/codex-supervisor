@@ -1,0 +1,441 @@
+import Foundation
+import PacerCore
+
+enum EngineProtocol {
+    static let version = 1
+    static let maximumCommandBytes = 64 * 1024
+    static let maximumSnapshotBytes = 1024 * 1024
+}
+
+struct EngineCommand: Decodable {
+    let protocolVersion: Int
+    let id: String
+    let method: String
+    let params: Parameters?
+    let supportsHarnessModules: Bool?
+
+    struct Parameters: Decodable {
+        var shell: EngineShellProjection.Request?
+        var expanded: Bool?
+        var discover: Bool?
+        var demoStage: Int?
+        var codexHome: String?
+        var codexExecutable: String?
+        var claudeHome: String?
+        var claudeOrganization: String?
+        var claudeSession: ClaudeWebSessionReply?
+        var claudeFetch: ClaudeWebFetchReply?
+        var webFetch: Bool?
+        var signedIn: Bool?
+        var requestID: String?
+        var context: String?
+        var notificationAction: String?
+        var navigationMessage: String?
+        var deepseekHome: String?
+        var sourceHome: String?
+        var sourceID: String?
+        var hideProjects: Bool?
+        var showEmbeddedCodexSessions: Bool?
+        var monitorDurable: Bool?
+        var monitorWSL: Bool?
+        var showEmbeddedClaudeSessions: Bool?
+        var showClaudeCloudProjects: Bool?
+        var monitorSSH: Bool?
+        var deepseekSettings: EngineDeepSeekSettings?
+        var reminderSettings: EngineReminderSettings?
+        var expandedPanel: EngineExpandedPanelSettings?
+        var claudeProgressRing: Bool?
+        var codexProgressRing: Bool?
+        var deepseekProgressRing: Bool?
+        /// Modules whose progress ring is off. A ring is on unless listed.
+        var disabledHarnessProgress: [String]?
+        var retentionMinutes: Int?
+        var enabledProviders: [String]?
+        var providerModes: [String: String]?
+        var provider: String?
+        /// A module's account credits from the host's sign-in; null clears them.
+        var accountCredits: HarnessAccountCredits?
+        var stale: Bool?
+        /// Data folders chosen in Settings for local modules, by module ID.
+        /// An empty path restores the default.
+        var harnessHomes: [String: String]?
+        /// Modules whose task rows leave out the credits each turn used.
+        var hiddenTurnCredits: [String]?
+        /// Each credits module's dial, bar value and reminder choices.
+        var harnessCredits: [String: HarnessCreditsSettings]?
+        /// With `refreshHarnessProgressConnection`: whether the module's app
+        /// runs, and since when (seconds since 1970), as the host sees it.
+        var appRunning: Bool?
+        var appStartedAt: Double?
+        /// And when the user opened the connectors from the card (seconds
+        /// since 1970), while that still holds.
+        var openedConnectorsAt: Double?
+        var activityID: String?
+        var snapshotSequence: UInt64?
+        var deepseekKey: String?
+        var balanceContext: String?
+        var webAvailable: Bool?
+        var webRequestID: String?
+        var webReply: DeepSeekWebReply?
+        var webSuccess: Bool?
+        var webNewSession: Bool?
+    }
+
+    static func correlationID(_ data: Data) -> String? {
+        struct Envelope: Decodable { let id: String }
+        guard data.count <= EngineProtocol.maximumCommandBytes,
+              let id = try? JSONDecoder().decode(Envelope.self, from: data).id,
+              !id.isEmpty, id.utf8.count <= 128,
+              !id.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
+        return id
+    }
+
+    static func decode(_ bytes: Data) throws -> Self {
+        guard bytes.count <= EngineProtocol.maximumCommandBytes else { throw Failure.tooLarge }
+        let command = try JSONDecoder().decode(Self.self, from: bytes)
+        guard command.protocolVersion == EngineProtocol.version else { throw Failure.version }
+        guard !command.id.isEmpty, command.id.utf8.count <= 128,
+              command.id.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
+              command.method.utf8.count <= 64 else { throw Failure.invalid }
+        return command
+    }
+    enum Failure: Error { case tooLarge, version, invalid }
+}
+
+/// A split or oversized pipe write cannot create an unbounded line buffer.
+struct EngineFramer {
+    private var pending = Data()
+    mutating func append(_ bytes: Data) throws -> [Data] {
+        var frames: [Data] = []
+        for byte in bytes {
+            if byte == 10 {
+                if pending.last == 13 { pending.removeLast() }
+                if !pending.isEmpty { frames.append(pending) }
+                pending.removeAll(keepingCapacity: true)
+            } else {
+                guard pending.count < EngineProtocol.maximumCommandBytes else { throw EngineCommand.Failure.tooLarge }
+                pending.append(byte)
+            }
+        }
+        return frames
+    }
+    mutating func finish() throws -> Data? {
+        defer { pending.removeAll() }
+        guard !pending.isEmpty else { return nil }
+        return pending
+    }
+}
+
+struct EngineTask: Codable, Equatable {
+    let id: String
+    let provider: String
+    let sessionID: String?
+    let turnID: String?
+    let parentThreadID: String?
+    let title: String
+    let source: String
+    let sourceID: String?
+    let phase: String
+    let stage: String
+    let stageLabel: String
+    let model: String?
+    let effort: String?
+    let tokensPerSecond: Double?
+    let rateReportedAt: Double?
+    let rateIsFresh: Bool
+    let rateIsEstimated: Bool
+    let firstTokenLatency: Double?
+    let startedAt: Double?
+    let unread: Bool
+    let failed: Bool
+    let turnCost: Double?
+    let turnPeakCost: Double?
+
+    init(_ activity: SessionActivity, unread: Bool, hideProjects: Bool, at now: Date) {
+        let rate = activity.displayedOutputEstimate(at: now)
+        id = activity.id; provider = activity.provider.rawValue
+        sessionID = activity.threadID; turnID = activity.turnID; parentThreadID = activity.parentThreadID
+        title = activity.observedSessionLabel ?? (hideProjects ? L10n.text("activity.local_task") : activity.title ?? activity.project)
+        source = hideProjects && activity.claudeCloud != nil ? L10n.text("connections.kind.claude_cloud")
+            : activity.sourceHost ?? L10n.text("common.local")
+        sourceID = activity.sourceHostID
+        phase = activity.observedPhase(at: now).rawValue; stage = activity.stage.rawValue
+        stageLabel = [.completed, .interrupted].contains(activity.phase) ? activity.endingLabel : activity.stage.label
+        model = activity.modelName.map { ModelDisplay.name($0, provider: activity.provider) }; effort = activity.reasoningEffort
+        tokensPerSecond = rate?.value; rateReportedAt = rate?.reportedAt.timeIntervalSince1970
+        rateIsFresh = rate?.isFresh == true; rateIsEstimated = activity.displayedRateIsEstimated(at: now)
+        firstTokenLatency = activity.firstTokenLatency
+        startedAt = activity.turnStartedAt?.timeIntervalSince1970
+        self.unread = unread; failed = activity.turnFailed
+        turnCost = activity.turnCost; turnPeakCost = activity.turnPeakCost
+    }
+}
+
+struct EngineRequest: Codable, Equatable {
+    let id: String
+    let provider: String
+    let activityID: String
+    let kind: String
+    let label: String
+    let detectedAt: Double
+    init(_ request: PendingAttentionRequest) {
+        id = request.id; provider = request.provider.rawValue
+        activityID = request.activity.id; kind = request.kind.rawValue
+        label = request.kind.label; detectedAt = request.detectedAt.timeIntervalSince1970
+    }
+}
+
+struct EngineSource: Codable, Equatable {
+    let id: String
+    let provider: String
+    let available: Bool
+    let transport: String
+    let reason: String?
+    var failure: CodexQuotaFailure? = nil
+    var sourceName: String? = nil
+    var state: String? = nil
+    var stateLabel: String? = nil
+    var sessions: Int? = nil
+    var quotaWindows: [EngineQuota.Window]? = nil
+    var quotaRefreshing = false
+    var quotaError: String? = nil
+}
+
+struct EngineModule: Codable, Equatable {
+    let provider: String
+    let mode: String
+    let installed: Bool?
+    let enabled: Bool
+    var displayName: String? = nil
+    var symbol: String? = nil
+    var status: String? = nil
+    var usage: HarnessUsage? = nil
+    var progressConnector: Bool? = nil
+    var hasTaskProgress: Bool? = nil
+    var reportsSessionUsage: Bool? = nil
+    var reportsAccountCredits: Bool? = nil
+    var progressSetup: LocalHarnessProgressStatus? = nil
+    var progressConnection: LocalHarnessProgressConnection? = nil
+    /// The progress ring card, worded by Core, for a module whose app must trust Pacer's tool.
+    var progressGuide: HarnessProgressGuide? = nil
+    /// Registry facts, so the host draws every module from one description.
+    var brand: EngineModuleBrand? = nil
+    var website: URL? = nil
+    var balance: String? = nil
+    /// Found on this computer or turned on explicitly: listed without
+    /// opening the module library.
+    var prominent: Bool? = nil
+    /// Read by the shared local adapter, with a data folder Settings can change.
+    var local: Bool? = nil
+    /// The last seven days of account credits, for History.
+    var week: DeepSeekSoloPresentation.Week? = nil
+    /// How the host opens the app: its URL scheme, the signer its handler
+    /// must carry, and where the app installs.
+    var launch: EngineModuleLaunch? = nil
+    /// The first row of the module page's Status card (`ModuleMonitoring`), while the module is on.
+    var monitoring: EngineStatusRow? = nil
+    /// Codex's Account row, read from its quota (`CodexAccountState`).
+    var account: EngineStatusRow? = nil
+}
+
+/// One Status row as Core words it: its state, tone (`positive`, `neutral`,
+/// `attention`), text, a line under it and at most one action.
+struct EngineStatusRow: Codable, Equatable, Sendable {
+    let state: String
+    let tone: String
+    let text: String
+    var detail: String? = nil
+    /// `openCodex`, `retry`, `rescan`, or `signIn` for an account.
+    var action: String? = nil
+
+    init(_ monitoring: ModuleMonitoring) {
+        state = monitoring.state.rawValue; tone = monitoring.tone.rawValue; text = monitoring.text
+        detail = monitoring.detail; action = monitoring.action?.rawValue
+    }
+    init(_ account: CodexAccountState, opensCodex: Bool) {
+        switch account {
+        case .checking: state = "checking"
+        case .signedIn: state = "signedIn"
+        case .signedOut: state = "signedOut"
+        case .unavailable: state = "unavailable"
+        }
+        tone = account.tone.rawValue; text = account.text; detail = account.detail
+        action = account == .signedOut && opensCodex ? "openCodex" : nil
+    }
+}
+
+struct EngineModuleLaunch: Codable, Equatable {
+    let scheme: String
+    let publisher: String
+    let executables: [String]
+    let connectorsPath: String?
+}
+
+struct EngineModuleBrand: Codable, Equatable {
+    let dark: String
+    let light: String
+    let accentLift: Double
+    let accentLuminance: Double
+    init(_ brand: HarnessBrand) {
+        dark = brand.dark.hex; light = brand.light.hex
+        accentLift = brand.accentLift; accentLuminance = brand.accentLuminance
+    }
+}
+
+/// A module's account credits as the engine knows them: from the host's
+/// sign-in, or the demo's sample.
+struct EngineAccountCredits: Codable, Equatable {
+    let provider: String
+    let credits: HarnessAccountCredits
+    let stale: Bool
+    /// What the host draws: the dial, the lines and the breakdown, worded by Core.
+    var presentation: HarnessCreditsPresentation? = nil
+}
+
+struct EngineQuota: Codable, Equatable {
+    struct Window: Codable, Equatable {
+        let id: String
+        let label: String
+        let remainingPercent: Double?
+        let remainingTimePercent: Double?
+        let pacePercent: Double?
+        let durationMinutes: Int?
+        let resetsAt: Double?
+        let countdown: String?
+        let verdict: String?
+        let verdictText: String?
+        let pressing: Bool
+        let valueText: String
+    }
+    let provider: String
+    let capturedAt: Double
+    let stale: Bool
+    let windows: [Window]
+    init(_ value: QuotaSnapshot, provider: AgentProvider, at now: Date) {
+        self.provider = provider.rawValue; capturedAt = value.capturedAt.timeIntervalSince1970
+        let expired = value.isStale(at: now)
+        stale = expired
+        windows = value.windows.map { window in
+            let pace = expired ? nil : window.pacePercent(at: now)
+            let verdict = pace.map { $0 < 85 ? "fast" : $0 > 115 ? "spare" : "steady" }
+            return .init(id: window.id, label: window.label, remainingPercent: window.remainingPercent,
+                remainingTimePercent: window.remainingTimePercent(at: now), pacePercent: pace,
+                durationMinutes: window.durationMinutes, resetsAt: window.resetsAt?.timeIntervalSince1970,
+                countdown: window.remainingSeconds(at: now).map {
+                    $0 <= 0 ? L10n.text("dashboard.countdown_waiting") : EngineTaskRow.duration($0)
+                }, verdict: verdict, verdictText: verdict.map { L10n.text("quota.verdict." + $0) },
+                pressing: !expired && (window.remainingPercent.map { $0 <= 15 } == true || verdict == "fast"),
+                valueText: window.remainingPercent.map { String(Int($0.rounded())) } ?? "—")
+        }
+    }
+}
+
+struct EngineNotice: Codable, Equatable {
+    struct Action: Codable, Equatable { let kind: String; let title: String; var reference: String? = nil }
+    let id: String
+    let kind: String
+    let title: String
+    let detail: String
+    let category: String?
+    let body: String?
+    let privateBody: String?
+    var actions: [Action]?
+    var defaultAction: Action? = nil
+    init(_ value: IslandNotice, hideProjects: Bool) {
+        id = value.id; kind = value.kind.rawValue; title = value.title
+        detail = hideProjects && value.kind != .lowQuota ? L10n.text("activity.local_task") : value.detail
+        category = value.category
+        let hidden = value.kind != .lowQuota ? L10n.text("activity.hidden_local_name") : value.detail
+        body = L10n.text("notice.body", value.title, hideProjects ? hidden : value.detail)
+        privateBody = L10n.text("notice.body", value.title, hidden)
+        if value.category == DeepSeekNoticePolicy.spikeCategory {
+            actions = [.init(kind: "openHarness", title: L10n.text("deepseek.notice.open_harness")), .init(kind: "snoozeSpike", title: L10n.text("deepseek.notice.snooze"))]
+        } else if value.category == DeepSeekNoticePolicy.balanceCategory {
+            actions = [.init(kind: "topUp", title: L10n.text("deepseek.notice.top_up"))]
+        } else { actions = nil }
+    }
+}
+
+struct EngineNavigationFailure: Codable, Equatable {
+    let id: String
+    let message: String
+    init(_ failure: ActivityNavigationState.Failure) { id = failure.id.uuidString; message = failure.message }
+}
+
+struct EngineSnapshot: Codable, Equatable {
+    let protocolVersion: Int
+    let type: String
+    let sequence: UInt64
+    let demo: Bool
+    let capturedAt: Double
+    let tasks: [EngineTask]
+    let requests: [EngineRequest]
+    let sources: [EngineSource]
+    let quota: [EngineQuota]
+    let notices: [EngineNotice]
+    let runningCount: Int
+    let waitingCount: Int
+    let totalTokensPerSecond: Double?
+    let rateIsFresh: Bool
+    let presentation: EnginePresentation
+    let wallet: EngineWallet?
+    let modules: [EngineModule]?
+    let quotaDashboard: EngineQuotaDashboard?
+    let compactWarnings: [CompactWarningPresentation.Item]?
+    let compactContext: CompactBarContext?
+    let deepseekConnection: EngineDeepSeekConnection?
+    let claudeConnection: EngineClaudeConnection?
+    let claudeCloudConnection: EngineClaudeCloudConnection?
+    let activityLinks: [EngineActivityLink]?
+    let claudeSetup: EngineClaudeHookSetup?
+    let codexProgressSetup: CodexProgressSetupStatus?
+    let deepseekProgressSetup: DeepSeekProgressSetupStatus?
+    let claudeRemoteSetups: [EngineClaudeRemoteSetup]?
+    let connections: ConnectionPagePresentation?
+    let navigationError: EngineNavigationFailure?
+    let openingActivityIDs: [String]?
+    var expandedPanel: EngineExpandedPanel? = nil
+    var accountCredits: [EngineAccountCredits]? = nil
+    /// Codex task tracking through Pacer's hooks; nil while Codex is not managed.
+    var codexHooks: EngineCodexHooks? = nil
+    var wslAvailability: WindowsWSLAvailability?
+
+    init(sequence: UInt64, demo: Bool, activities: [SessionActivity], requests: [PendingAttentionRequest],
+         sources: [EngineSource], quota: [EngineQuota], notices: [IslandNotice], inbox: CompletionInbox,
+         hideProjects: Bool, now: Date, wallet: EngineWallet? = nil, modules: [EngineModule]? = nil, quotaDashboard: EngineQuotaDashboard? = nil,
+         showsDeepSeekTurnCost: Bool = true, progressRingProviders: Set<AgentProvider> = [],
+         compactWarnings: [CompactWarningPresentation.Item]? = nil, compactContext: CompactBarContext? = nil,
+         taskPresentation: ActivityTaskPresentation? = nil,
+         deepseekConnection: EngineDeepSeekConnection? = nil, claudeConnection: EngineClaudeConnection? = nil,
+         claudeCloudConnection: EngineClaudeCloudConnection? = nil, activityLinks: [EngineActivityLink]? = nil,
+         notificationProjections: [EngineNotice]? = nil,
+         navigationError: EngineNavigationFailure? = nil, openingActivityIDs: [String]? = nil, claudeSetup: EngineClaudeHookSetup? = nil,
+         claudeRemoteSetups: [EngineClaudeRemoteSetup]? = nil, connections: ConnectionPagePresentation? = nil,
+         codexProgressSetup: CodexProgressSetupStatus? = nil, deepseekProgressSetup: DeepSeekProgressSetupStatus? = nil) {
+        protocolVersion = EngineProtocol.version; type = "snapshot"; self.sequence = sequence
+        self.demo = demo; capturedAt = now.timeIntervalSince1970
+        tasks = activities.sorted { $0.id < $1.id }.map { EngineTask($0, unread: inbox.isUnread($0), hideProjects: hideProjects, at: now) }
+        self.requests = requests.map(EngineRequest.init); self.sources = sources; self.quota = quota
+        self.notices = notificationProjections ?? notices.map { EngineNotice($0, hideProjects: hideProjects) }
+        let overview = taskPresentation?.overview ?? ActivityOverview(activities: activities, at: now)
+        runningCount = overview.running.count; waitingCount = overview.waiting.count
+        totalTokensPerSecond = overview.displayedRate; rateIsFresh = overview.rateIsFresh
+        presentation = taskPresentation.map(EnginePresentation.init) ?? EnginePresentation(activities: activities, requests: requests, inbox: inbox, hideProjects: hideProjects, at: now,
+            showsDeepSeekTurnCost: showsDeepSeekTurnCost, progressRingProviders: progressRingProviders)
+        self.wallet = wallet
+        self.modules = modules
+        self.quotaDashboard = quotaDashboard
+        self.compactWarnings = compactWarnings
+        self.compactContext = compactContext
+        self.deepseekConnection = deepseekConnection
+        self.claudeConnection = claudeConnection
+        self.claudeCloudConnection = claudeCloudConnection
+        self.activityLinks = activityLinks
+        self.claudeSetup = claudeSetup
+        self.codexProgressSetup = codexProgressSetup
+        self.deepseekProgressSetup = deepseekProgressSetup
+        self.claudeRemoteSetups = claudeRemoteSetups
+        self.connections = connections
+        self.navigationError = navigationError; self.openingActivityIDs = openingActivityIDs
+    }
+}

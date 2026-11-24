@@ -1,0 +1,275 @@
+import AppKit
+import SwiftUI
+import XCTest
+@testable import PacerCore
+@testable import PacerIsland
+import PacerTestSupport
+
+@MainActor
+final class QuotaDashboardModelTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private func fixture(_ initialPeriod: String? = nil) throws -> (IslandModel, UserDefaults) {
+        let domain = testDefaultsName("dashboard-model-tests")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        addTeardownBlock { removeTestDefaults(domain) }
+        ProviderModules(codexMode: .enabled, claudeMode: .enabled).save(to: defaults)
+        if let initialPeriod { defaults.set(initialPeriod, forKey: "quotaDashboardPeriod") }
+        let clock = now
+        let model = IslandModel(demo: true, demoClock: { clock }, demoArguments: nil, defaults: defaults,
+            installation: ProviderInstallationDetection(codexInstalled: false, claudeInstalled: false))
+        for provider in HarnessRegistry.legacyIDs { model.selectProvider(provider); model.quota = nil }
+        model.selectProvider(.codex)
+        return (model, defaults)
+    }
+    private func window(_ id: String, minutes: Int?, used: Double? = 20, reset: Date? = nil) -> QuotaWindow {
+        QuotaWindow(id: id, usedPercent: used, durationMinutes: minutes,
+            resetsAt: reset ?? minutes.map { now.addingTimeInterval(Double($0) * 30) })
+    }
+    private func bucket(_ id: String, _ windows: [QuotaWindow]) -> QuotaBucket {
+        QuotaBucket(id: id, name: id, plan: nil, windows: windows, credits: nil)
+    }
+    private func publish(_ snapshot: QuotaSnapshot?, for provider: AgentProvider, to model: IslandModel) {
+        model.selectProvider(provider); model.quota = snapshot
+    }
+    private func snapshot(_ buckets: [QuotaBucket], at: Date? = nil) -> QuotaSnapshot {
+        QuotaSnapshot(buckets: buckets, capturedAt: at ?? now, accountScope: "synthetic-scope", resetCredits: nil)
+    }
+
+    func testQuotaStyleDefaultsToSplitAndPersistsBothChoicesWithoutChangingQuotaOrCollapsedSelection() throws {
+        let (model, defaults) = try fixture()
+        XCTAssertEqual(model.expandedQuotaStyle, .split)
+        defaults.set("unknown-style", forKey: ExpandedQuotaStyle.defaultsKey)
+        XCTAssertEqual(model.expandedQuotaStyle, .split)
+        let sample = snapshot([bucket("codex", [window("codex/five", minutes: 300), window("codex/week", minutes: 10080)])])
+        publish(sample, for: .codex, to: model)
+        defaults.set("5h", forKey: "quotaWindowID")
+        for style in [ExpandedQuotaStyle.classic, .split, .classic] {
+            style.save(to: defaults)
+            model.applySettings(sourceChanged: false)
+            XCTAssertEqual(model.expandedQuotaStyle, style)
+            XCTAssertEqual(ExpandedQuotaStyle.load(from: defaults), style, "The next launch keeps the saved choice")
+            XCTAssertEqual(model.providerQuota(.codex), sample)
+            XCTAssertEqual(model.providerSelectedWindow(.codex)?.id, "codex/five")
+            XCTAssertEqual(model.enabledProviders, [.codex, .claude])
+        }
+    }
+
+    func testExactPeriodsUseTheProviderBucketAndIndependentProviderValues() throws {
+        let (model, defaults) = try fixture()
+        publish(snapshot([bucket("codex", [window("codex/five", minutes: 300), window("codex/week", minutes: 10080)]),
+                          bucket("codex-review", [window("codex-review/week", minutes: 10080, used: 65), window("codex-review/eight", minutes: 480)])]), for: .codex, to: model)
+        publish(snapshot([bucket("claude", [window("claude/five", minutes: 300, used: 40), window("claude/week", minutes: 10080)]),
+                          bucket("claude/opus", [window("claude/opus/week", minutes: 10080)])]), for: .claude, to: model)
+        defaults.set("codex-review/week", forKey: "quotaWindowID")
+        XCTAssertEqual(model.providerWindow(.codex, period: .fiveHour)?.id, "codex/five",
+            "An earlier saved model-scoped window cannot move the dashboard off the account bucket")
+        XCTAssertEqual(model.providerWindow(.codex, period: .weekly)?.id, "codex/week")
+        XCTAssertNil(model.dashboardQuota(provider: .codex, period: .weekly).bucketName)
+        XCTAssertEqual(model.providerSelectedWindow(.codex)?.id, "codex/week", "An earlier saved weekly window reads as 7 days")
+        XCTAssertEqual(model.providerWindow(.claude, period: .fiveHour)?.id, "claude/five")
+        XCTAssertEqual(model.dashboardQuota(provider: .claude, period: .fiveHour).remainingQuotaPercent, 60)
+        defaults.set("claude/opus/week", forKey: "claudeQuotaWindowID")
+        XCTAssertEqual(model.providerWindow(.claude, period: .weekly)?.id, "claude/week")
+        defaults.set("5h", forKey: "claudeQuotaWindowID")
+        XCTAssertEqual(model.providerSelectedWindow(.claude)?.id, "claude/five")
+        defaults.set("7d", forKey: "quotaWindowID")
+        XCTAssertEqual(model.providerSelectedWindow(.codex)?.id, "codex/week")
+        XCTAssertEqual(model.dashboardQuota(provider: .codex, period: .fiveHour).remainingQuotaPercent, 80)
+        XCTAssertEqual(model.selectedProvider, .claude, "Provider presentation reads do not change quota selection")
+        XCTAssertFalse(model.providerIsWeeklyOnly(.codex))
+        defaults.set("5h", forKey: "quotaWindowID")
+        publish(snapshot([bucket("codex", [window("codex/week", minutes: 10080)])]), for: .codex, to: model)
+        XCTAssertTrue(model.providerIsWeeklyOnly(.codex), "A weekly-only account offers no 5-hour choice")
+        XCTAssertEqual(model.providerSelectedWindow(.codex)?.id, "codex/week", "A saved 5-hour choice falls back to 7 days")
+        publish(nil, for: .codex, to: model)
+        XCTAssertFalse(model.providerIsWeeklyOnly(.codex), "Unread quota cannot prove the account is weekly-only")
+    }
+
+    func testWeeklyOnlyProRequiresActualPrimaryBucketFreshUsageAndKnownFutureReset() throws {
+        let (model, _) = try fixture()
+        for provider in [AgentProvider.codex, .claude] {
+            let weekly = window(provider.rawValue + "/week", minutes: 10080)
+            publish(snapshot([bucket(provider.rawValue, [weekly])]), for: provider, to: model)
+            XCTAssertEqual(model.dashboardQuota(provider: provider, period: .fiveHour).availability, .proOnly)
+            for candidate in [snapshot([]),
+                snapshot([bucket(provider.rawValue, [window("unknown-usage", minutes: 10080, used: nil)])]),
+                snapshot([bucket(provider.rawValue, [QuotaWindow(id: "unknown-reset", usedPercent: 20, durationMinutes: 10080, resetsAt: nil)])]),
+                snapshot([bucket(provider.rawValue, [window("expired", minutes: 10080, reset: now)])]),
+                snapshot([bucket(provider.rawValue, [weekly, window("untyped", minutes: nil)])]),
+                snapshot([bucket(provider.rawValue + "/scoped", [weekly])])] {
+                publish(candidate, for: provider, to: model)
+                XCTAssertNotEqual(model.dashboardQuota(provider: provider, period: .fiveHour).availability, .proOnly)
+            }
+            publish(nil, for: provider, to: model)
+            XCTAssertEqual(model.dashboardQuota(provider: provider, period: .fiveHour).availability, .unavailable)
+            publish(snapshot([bucket(provider.rawValue, [weekly])], at: now.addingTimeInterval(-601)), for: provider, to: model)
+            XCTAssertEqual(model.dashboardQuota(provider: provider, period: .fiveHour).availability, .stale)
+            publish(snapshot([bucket(provider.rawValue, [weekly])]), for: provider, to: model)
+            model.errorMessage = "Synthetic service failure"
+            XCTAssertEqual(model.dashboardQuota(provider: provider, period: .fiveHour).availability, .stale)
+            model.errorMessage = nil
+        }
+    }
+
+    func testRemainingRingsPreserveUnknownFieldsBoundsAndExpiredStaleData() throws {
+        let (model, _) = try fixture()
+        let five = window("codex/five", minutes: 300, reset: now.addingTimeInterval(9000))
+        publish(snapshot([bucket("codex", [five])]), for: .codex, to: model)
+        var data = model.dashboardQuota(provider: .codex, period: .fiveHour)
+        XCTAssertEqual(data.remainingQuotaPercent, 80); XCTAssertEqual(data.remainingTimePercent, 50)
+        XCTAssertEqual(data.availability, .available)
+        for (used, expected) in [(-20.0, 100.0), (130.0, 0.0)] {
+            publish(snapshot([bucket("codex", [window("codex/five", minutes: 300, used: used, reset: now.addingTimeInterval(36000))])]), for: .codex, to: model)
+            data = model.dashboardQuota(provider: .codex, period: .fiveHour)
+            XCTAssertEqual(data.remainingQuotaPercent, expected); XCTAssertEqual(data.remainingTimePercent, 100)
+        }
+        publish(snapshot([bucket("codex", [QuotaWindow(id: "codex/five", usedPercent: .nan, durationMinutes: 300, resetsAt: nil)])]), for: .codex, to: model)
+        data = model.dashboardQuota(provider: .codex, period: .fiveHour)
+        XCTAssertNil(data.remainingQuotaPercent); XCTAssertNil(data.remainingTimePercent)
+        XCTAssertEqual(data.availability, .available, "Unknown components stay unmeasured rather than inferring PRO")
+        publish(snapshot([bucket("codex", [window("codex/five", minutes: 300, reset: now)])]), for: .codex, to: model)
+        data = model.dashboardQuota(provider: .codex, period: .fiveHour)
+        XCTAssertEqual(data.availability, .stale); XCTAssertEqual(data.remainingQuotaPercent, 80)
+        XCTAssertNil(data.remainingTimePercent)
+        XCTAssertEqual(data.freshnessText, L10n.text("quota.expired"))
+    }
+
+    func testPaceVerdictUsesExistingThresholdsAndDurationsShareCountdownWording() throws {
+        for (pace, verdict) in [(84.9, QuotaPaceVerdict.fast), (85, .steady), (115, .steady), (115.1, .spare), (1000, .spare)] {
+            XCTAssertEqual(QuotaPaceVerdict(pace: pace), verdict, "Pace \(pace)")
+        }
+        let (model, _) = try fixture()
+        // 80% quota left with 50% of the window left is spare; the tick sits at the time fraction.
+        publish(snapshot([bucket("codex", [window("codex/five", minutes: 300, reset: now.addingTimeInterval(9000))])]), for: .codex, to: model)
+        let data = model.dashboardQuota(provider: .codex, period: .fiveHour)
+        XCTAssertEqual(data.window?.pacePercent(at: now).map(QuotaPaceVerdict.init(pace:)), .spare)
+        XCTAssertEqual(data.remainingTimePercent, 50)
+        XCTAssertEqual(CompactDuration.text(59), L10n.text("dashboard.countdown_soon"))
+        XCTAssertEqual(CompactDuration.text(60), L10n.text("dashboard.countdown_minutes", 1))
+        XCTAssertEqual(CompactDuration.text(7740), L10n.text("dashboard.countdown_hours", 2, 9))
+        XCTAssertEqual(CompactDuration.text(277_200), L10n.text("dashboard.countdown_days", 3, 5))
+    }
+
+    func testEarlierSavedPeriodIsIgnoredWithoutChangingCollapsedWindowOrProvider() throws {
+        let (model, defaults) = try fixture("5h")
+        defaults.set("codex/custom", forKey: "quotaWindowID")
+        defaults.set("claude/custom", forKey: "claudeQuotaWindowID")
+        let provider = model.selectedProvider
+        XCTAssertEqual(QuotaDashboardLayout.slots(providers: model.enabledProviders).map(\.provider), [.codex, .claude],
+            "A 5h choice from the removed switch cannot hide either provider")
+        XCTAssertEqual(defaults.string(forKey: "quotaDashboardPeriod"), "5h", "Loading leaves removal to the next Settings save")
+        XCTAssertEqual(model.selectedProvider, provider)
+        XCTAssertEqual(defaults.string(forKey: "quotaWindowID"), "codex/custom")
+        XCTAssertEqual(defaults.string(forKey: "claudeQuotaWindowID"), "claude/custom")
+    }
+
+    func testDashboardFallbackHeightIgnoresMovedWindowDetailsAndKeepsMeasuredGeometry() throws {
+        let (model, defaults) = try fixture()
+        publish(snapshot([bucket("codex", [window("codex/week", minutes: 10080)])]), for: .codex, to: model)
+        let before = model.panelContentHeight
+        publish(snapshot([bucket("codex", (0..<12).map { window("codex/\($0)", minutes: 480) })]), for: .codex, to: model)
+        XCTAssertEqual(model.panelContentHeight, before, "Details moved to Settings cannot enlarge the two-ring dashboard fallback")
+        ProviderModules(codexMode: .enabled, claudeMode: .disabled).save(to: defaults)
+        model.applySettings(sourceChanged: false)
+        XCTAssertGreaterThan(model.panelContentHeight, before, "The Codex-only legacy exception reserves room for its actual bars")
+        XCTAssertLessThanOrEqual(model.panelContentHeight, 640, "Many legacy service windows remain bounded by the existing panel limit")
+        model.updateMeasuredContentHeight(511.2)
+        XCTAssertEqual(model.panelContentHeight, 512)
+        publish(snapshot([bucket("codex", [])]), for: .codex, to: model)
+        XCTAssertEqual(model.panelContentHeight, 512, "The existing real content measurement still takes precedence")
+    }
+
+    func testSettingsHistoryWarningsFreshnessAndServiceDetailsStayProviderIndependent() throws {
+        let (model, defaults) = try fixture()
+        let credit = CreditBalance(hasCredits: true, unlimited: false, balance: "12.50")
+        let reset = QuotaResetSummary(availableCount: 2, credits: [QuotaResetCredit(id: "synthetic-credit", status: "available", expiresAt: now.addingTimeInterval(86400), grantedAt: now)])
+        let codex = QuotaSnapshot(buckets: [QuotaBucket(id: "codex", name: nil, plan: nil,
+            windows: [window("codex/week", minutes: 10080), window("codex/eight", minutes: 480)], credits: credit),
+            bucket("codex/review", [window("codex/review/week", minutes: 10080, used: 50)])],
+            capturedAt: now.addingTimeInterval(-700), accountScope: "synthetic-codex", resetCredits: reset)
+        let claude = QuotaSnapshot(buckets: [bucket("claude", [window("claude/week", minutes: 10080, used: 40)])],
+            capturedAt: now, accountScope: "synthetic-claude", resetCredits: nil)
+        for (provider, value, warning) in [(AgentProvider.codex, codex, "Synthetic Codex warning"), (.claude, claude, "Synthetic Claude warning")] {
+            publish(value, for: provider, to: model)
+            var history = QuotaCycleHistory(); history.record(value)
+            model.history = history; model.historyWarning = warning
+        }
+        defaults.set("codex/review/week", forKey: "quotaWindowID")
+        XCTAssertEqual(model.providerCurrentCycle(.codex)?.id, "codex/week", "History follows the account bucket, not an earlier saved window")
+        XCTAssertEqual(model.providerCurrentCycle(.claude)?.id, "claude/week")
+        XCTAssertEqual(model.providerHistoryWarning(.codex), "Synthetic Codex warning")
+        XCTAssertEqual(model.providerHistoryWarning(.claude), "Synthetic Claude warning")
+        XCTAssertEqual(model.dashboardQuota(provider: .codex, period: .weekly).availability, .stale)
+        XCTAssertNotEqual(model.dashboardQuota(provider: .claude, period: .weekly).availability, .stale)
+        XCTAssertNotEqual(model.providerFreshnessText(.codex, period: .weekly), model.providerFreshnessText(.claude, period: .weekly))
+        XCTAssertEqual(model.providerQuota(.codex)?.credits, credit)
+        XCTAssertEqual(model.providerQuota(.codex)?.resetCredits, reset)
+        XCTAssertEqual(model.providerQuota(.codex)?.windows.first(where: { $0.id == "codex/eight" })?.durationMinutes, 480)
+        XCTAssertEqual(model.providerSourceText(.codex), L10n.text("quota.source_codex"))
+        XCTAssertNil(model.providerSourceText(.claude), "A synthetic snapshot without source provenance cannot invent it")
+        XCTAssertEqual(model.selectedProvider, .claude)
+    }
+
+    func testCodexResetsExpiringInsideTheLeadTimeWarnAndOpenHistory() throws {
+        let (model, defaults) = try fixture()
+        let reset = QuotaResetSummary(availableCount: 3, credits: [
+            QuotaResetCredit(id: "synthetic-a", status: "available", expiresAt: now.addingTimeInterval(7_200), grantedAt: now),
+            QuotaResetCredit(id: "synthetic-b", status: "available", expiresAt: now.addingTimeInterval(30 * 3_600), grantedAt: now),
+            QuotaResetCredit(id: "synthetic-c", status: "available", expiresAt: now.addingTimeInterval(10 * 86_400), grantedAt: now)])
+        publish(QuotaSnapshot(buckets: [bucket("codex", [window("codex/week", minutes: 10080)])], capturedAt: now,
+            accountScope: "synthetic-codex", resetCredits: reset), for: .codex, to: model)
+        func item() -> CompactWarningPresentation.Item? { model.compactWarningItems.first { $0.kind == .resetExpiry } }
+        XCTAssertEqual(model.resetExpiryLeadDays, ResetExpiryReminder.defaultLeadDays)
+        XCTAssertTrue(CompactIslandComponent.activeWarnings(model).contains(.resetExpiry))
+        model.setResetExpiryLeadDays(1)
+        XCTAssertEqual(item()?.help, L10n.text("warning.reset_expiry_help", 1, CompactDuration.text(7_200), L10n.date(now.addingTimeInterval(7_200), time: .standard)))
+        model.setResetExpiryLeadDays(2)
+        XCTAssertEqual(defaults.integer(forKey: ResetExpiryReminder.defaultsKey), 2, "The lead time is saved at once")
+        XCTAssertEqual(item()?.help, L10n.text("warning.reset_expiry_help", 1, CompactDuration.text(7_200), L10n.date(now.addingTimeInterval(7_200), time: .standard))
+            + L10n.text("warning.reset_expiry_more", 1))
+        model.setResetExpiryLeadDays(90)
+        XCTAssertEqual(model.resetExpiryLeadDays, ResetExpiryReminder.defaultLeadDays, "A lead time outside the range falls back to the default")
+        publish(QuotaSnapshot(buckets: [bucket("codex", [window("codex/week", minutes: 10080)])], capturedAt: now,
+            accountScope: "synthetic-codex", resetCredits: QuotaResetSummary(availableCount: 0, credits: [])), for: .codex, to: model)
+        XCTAssertNil(item(), "Nothing available, nothing to lose")
+
+        // The panel's capsule asks History for Codex's deadlines exactly once.
+        let saved = UserDefaults.standard.object(forKey: SettingsPane.defaultsKey)
+        defer { UserDefaults.standard.set(saved, forKey: SettingsPane.defaultsKey) }
+        var opened = 0; model.onSettings = { opened += 1 }
+        model.openResetExpiries()
+        XCTAssertEqual(opened, 1); XCTAssertEqual(SettingsPane.load(), .history)
+        XCTAssertTrue(model.takeResetExpiryRequest()); XCTAssertFalse(model.takeResetExpiryRequest())
+    }
+
+    func testResetCapsuleTakesTurnsBesideOtherDialsInTheBarsRhythm() async throws {
+        func account(_ credits: [QuotaResetCredit], count: Int = 3) -> QuotaAccountPresentation {
+            QuotaAccountPresentation(snapshot: QuotaSnapshot(buckets: [], capturedAt: now, accountScope: "synthetic-codex",
+                resetCredits: QuotaResetSummary(availableCount: count, credits: credits)), context: "", now: now)
+        }
+        let dated = account([QuotaResetCredit(id: "synthetic-a", status: "available", expiresAt: now.addingTimeInterval(30 * 3_600), grantedAt: now)])
+        let text = try XCTUnwrap(dated.panelText), count = try XCTUnwrap(dated.panelCountText), time = try XCTUnwrap(dated.panelTimeText)
+        XCTAssertEqual(CodexResetCapsule.turns(dated, alternates: false), [text], "Alone on its title row it shows the whole line")
+        XCTAssertEqual(CodexResetCapsule.turns(dated, alternates: true), [count, time], "Beside other dials the count and the time left take turns")
+        let undated = account([QuotaResetCredit(id: "synthetic-b", status: "available", expiresAt: nil, grantedAt: now)])
+        XCTAssertEqual(CodexResetCapsule.turns(undated, alternates: true), [try XCTUnwrap(undated.panelCountText)],
+            "Without a known deadline the count stays")
+        XCTAssertEqual(CodexResetCapsule.turns(account([], count: 0), alternates: true), [], "No reset, no capsule")
+
+        // The turns run on the collapsed bar's own rotation and clock.
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: 40), styleMask: .borderless, backing: .buffered, defer: false)
+        let host = NSHostingView(rootView: QuotaLinkButton(title: text, turns: [count, time], action: {}).fixedSize())
+        host.frame = window.contentRect(forFrameRect: window.frame); window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        func find(_ view: NSView) -> AlternatingQuotaView? {
+            (view as? AlternatingQuotaView) ?? view.subviews.lazy.compactMap(find).first
+        }
+        let rotation = try XCTUnwrap(find(host))
+        let layers = try XCTUnwrap(rotation.layer?.sublayers)
+        XCTAssertEqual(layers.count, 2)
+        let turn = try XCTUnwrap(layers[0].animation(forKey: "alternate"))
+        XCTAssertEqual(turn.beginTime, AlternatingQuotaText.epoch)
+        XCTAssertEqual(turn.duration, 2 * AlternatingQuotaText.interval, accuracy: 0.001)
+    }
+}

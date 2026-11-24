@@ -1,0 +1,123 @@
+import Foundation
+
+/// The Settings history section uses the same window readings as the island,
+/// while preserving empty buckets and each window's own pacing eligibility.
+public struct QuotaHistoryPresentation: Codable, Equatable, Sendable {
+    public let title: String
+    public let sourceText: String?
+    public let freshnessText: String
+    public let notUpdated: Bool
+    public let errorText: String?
+    public let placeholder: String?
+    public let chart: QuotaCycleChartPresentation?
+    public let buckets: [QuotaDashboardPresentation.LegacyBucket]
+    public let account: QuotaAccountPresentation?
+    public let warning: String?
+    public let refreshTitle: String
+    public let refreshing: Bool
+
+    public init(provider: AgentProvider, snapshot: QuotaSnapshot?, weekly: QuotaDashboardPresentation.Reading,
+                chart: QuotaCycleChartPresentation?, error: String?, warning: String?, refreshing: Bool,
+                accountContext: String, now: Date) {
+        title = L10n.text("settings.quota_history", provider.displayName)
+        sourceText = weekly.sourceText; freshnessText = weekly.freshnessText
+        notUpdated = snapshot?.isStale(at: now) == true || weekly.resetsAt.map { $0 <= now.timeIntervalSince1970 } == true || error != nil
+        errorText = error; self.warning = warning; self.refreshing = refreshing
+        refreshTitle = L10n.text(refreshing ? "common.retrying" : "common.refresh")
+        self.chart = snapshot == nil ? nil : chart
+        if let snapshot {
+            placeholder = chart == nil && weekly.windowID != nil ? L10n.text("quota.waiting_sample") : nil
+            buckets = snapshot.buckets.map { bucket in
+                .init(id: bucket.id, title: snapshot.buckets.count > 1 ? bucket.name ?? bucket.id : nil,
+                    windows: bucket.windows.map { window in
+                        .init(window: window, allowPace: !snapshot.isStale(at: now) && error == nil && window.resetsAt.map { $0 > now } == true, now: now)
+                    })
+            }
+            account = provider == .codex || snapshot.credits != nil || snapshot.resetCredits != nil
+                ? QuotaAccountPresentation(snapshot: snapshot, context: accountContext, now: now) : nil
+        } else {
+            placeholder = refreshing ? L10n.text("quota.loading") : L10n.text("quota.not_connected", provider.displayName)
+            buckets = []; account = nil
+        }
+    }
+}
+
+/// Formatted account usage contains no account scope or reset-credit identity.
+/// Context is an opaque, process-local token supplied by the owning source.
+public struct QuotaAccountPresentation: Codable, Equatable, Sendable {
+    public struct Expiry: Codable, Equatable, Sendable {
+        public let timestamp: Double
+        public let dateText: String
+        public let countText: String
+        public let accessibilityLabel: String
+        /// "1d 10h left", counted down from the fixed deadline.
+        public let remainingText: String
+        /// Under three days, the same rule as `expirySoon`.
+        public let soon: Bool
+    }
+    /// Deadlines closer than this are drawn in the attention color.
+    public static let soonInterval: TimeInterval = 3 * 86400
+    public let context: String
+    public let resetText: String
+    public let expirySoon: Bool
+    public let expiryDescription: String
+    /// "Next expires in 1d 10h"; nil without a known deadline.
+    public let nextExpiryText: String?
+    /// The expanded panel's capsule under the Codex quota, e.g. "Resets: 3 · expires in 1d 10h".
+    /// Nil when no reset is available or the count is unknown.
+    public let panelText: String?
+    /// A capsule that shares its row with other services alternates these two:
+    /// the count ("Resets: 3") and the time left on the next deadline ("1d 10h").
+    /// The time is nil without a known deadline, and then the count stays.
+    public let panelCountText: String?
+    public let panelTimeText: String?
+    public let resetsAccessibility: String
+    public let balanceText: String
+    public let balanceAccessibility: String
+    public let detailMessage: String?
+    public let expiries: [Expiry]
+    public let nonExpiringText: String?
+    public let unknownText: String?
+    public let timeZoneText: String?
+
+    public init(snapshot: QuotaSnapshot, context: String, now: Date) {
+        self.context = context
+        let summary = snapshot.resetCredits
+        let count = summary?.remainingCount(at: now, capturedAt: snapshot.capturedAt)
+        let expiry = summary?.nextExpiry(at: now)
+        resetText = count.map { L10n.text("account.reset_count", $0) } ?? L10n.text("account.resets_unknown")
+        expirySoon = expiry.map { $0.timeIntervalSince(now) < Self.soonInterval } ?? false
+        let countdown = expiry.map { CompactDuration.text($0.timeIntervalSince(now)) }
+        nextExpiryText = count == 0 ? nil : countdown.map {
+            L10n.text(summary?.hasCompleteDetails == false ? "account.known_next_expires_in" : "account.next_expires_in", $0)
+        }
+        if count == 0 { expiryDescription = L10n.text("account.no_resets") }
+        else if let expiry {
+            expiryDescription = L10n.text(summary?.hasCompleteDetails == false ? "account.known_expiry" : "account.next_expiry", L10n.date(expiry, date: .complete))
+        } else { expiryDescription = L10n.text(summary?.hasNoExpiringCredits(at: now) == true ? "account.no_expiry" : "account.expiry_unknown") }
+        resetsAccessibility = L10n.text("account.resets_accessibility", count.map(String.init) ?? L10n.text("common.unknown"), expiryDescription)
+        if let credits = snapshot.credits, credits.unlimited { balanceText = L10n.text("common.unlimited") }
+        else if let amount = snapshot.credits?.amount {
+            let formatter = NumberFormatter(); formatter.numberStyle = .decimal; formatter.locale = L10n.locale; formatter.maximumFractionDigits = 2
+            balanceText = formatter.string(from: NSDecimalNumber(decimal: amount)) ?? "—"
+        } else { balanceText = "—" }
+        balanceAccessibility = L10n.text("account.credit_balance", balanceText)
+        let details = summary?.expiryDetails(at: now, capturedAt: snapshot.capturedAt)
+        detailMessage = count == 0 ? L10n.text("account.no_resets") : details == nil ? L10n.text("account.expiry_unknown") : nil
+        expiries = count == 0 ? [] : (details?.expiries ?? []).map { expiry in
+            let date = L10n.date(expiry.date, time: .standard), left = expiry.date.timeIntervalSince(now)
+            let remaining = L10n.text("account.expiry_remaining", CompactDuration.text(left))
+            return Expiry(timestamp: expiry.date.timeIntervalSince1970, dateText: date,
+                countText: L10n.text("chart.expiry_count", expiry.count),
+                accessibilityLabel: L10n.text("chart.expiry_item", expiry.count, date) + L10n.text("chart.detail_separator") + remaining,
+                remainingText: remaining, soon: left < Self.soonInterval)
+        }
+        nonExpiringText = count != 0 && (details?.nonExpiringCount ?? 0) > 0 ? L10n.text("account.non_expiring_count", details!.nonExpiringCount) : nil
+        unknownText = count != 0 && (details?.unknownCount ?? 0) > 0 ? L10n.text("account.unknown_expiry_count", details!.unknownCount) : nil
+        timeZoneText = expiries.isEmpty ? nil : L10n.text("account.expiry_timezone", L10n.timeZone.identifier)
+        if let count, count > 0 {
+            panelText = countdown.map { L10n.text("account.panel_resets_expiring", count, $0) } ?? L10n.text("account.panel_resets", count)
+            panelCountText = L10n.text("account.panel_resets", count); panelTimeText = countdown
+        } else { panelText = nil; panelCountText = nil; panelTimeText = nil }
+    }
+}

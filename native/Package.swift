@@ -1,0 +1,29 @@
+// swift-tools-version: 5.10
+import PackageDescription
+
+let package = Package(
+    name: "CodexPacerIsland",
+    defaultLocalization: "en",
+    platforms: [.macOS(.v14)],
+    products: [.executable(name: "CodexPacerIsland", targets: ["PacerIsland"]),
+               .executable(name: "PacerRelaunch", targets: ["PacerRelaunch"])],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0")
+    ],
+    targets: [
+        // Decompression-only Zstandard for DeepSeek Harness session logs.
+        .target(name: "CZstd", exclude: ["README.md", "LICENSE"],
+            cSettings: [.define("ZSTD_DISABLE_ASM"), .define("ZSTD_LEGACY_SUPPORT", to: "0"), .define("ZSTD_NO_TRACE")]),
+        .target(name: "CGzip", exclude: ["README.md", "provenance.json", "vendor/LICENSE"], cSettings: [.define("Z_PREFIX"), .define("Z_SOLO")]),
+        .target(name: "PacerCore", dependencies: ["CZstd", "CGzip"], resources: [.process("Resources")], linkerSettings: [.linkedLibrary("sqlite3")]),
+        .target(name: "PacerMacSupport", dependencies: ["PacerCore"]),
+        .executableTarget(name: "PacerRelaunch"),
+        .executableTarget(name: "PacerIsland", dependencies: ["PacerCore", "PacerMacSupport", .product(name: "Sparkle", package: "Sparkle")],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]),
+        // Shared test helpers; never linked into the app.
+        .target(name: "PacerTestSupport", path: "Tests/PacerTestSupport"),
+        .testTarget(name: "PacerCoreTests", dependencies: ["PacerCore", "PacerMacSupport", "PacerTestSupport"]),
+        .testTarget(name: "PacerMacSupportTests", dependencies: ["PacerCore", "PacerMacSupport"]),
+        .testTarget(name: "PacerIslandTests", dependencies: ["PacerIsland", "PacerCore", "PacerMacSupport", "PacerTestSupport"])
+    ]
+)

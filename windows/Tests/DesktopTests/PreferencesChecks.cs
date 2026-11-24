@@ -1,0 +1,180 @@
+using System.Text.Json;
+using CodexPacer.Windows;
+
+internal static class PreferencesChecks
+{
+    internal static DesktopPreferences Run()
+    {
+        string root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "pacer-prefs-" + Guid.NewGuid().ToString("N")));
+        string file = Path.Combine(root, "preferences.json");
+        // Maintenance's inspection mode must remain read-only, including on damage.
+        var store = new PreferencesStore(file, recoverDamagedFiles: false);
+        try
+        {
+            var missing = store.Load();
+            Check(!missing.Unavailable && missing.Value.IsValid && !Directory.Exists(root), "Missing settings must use defaults without creating files");
+            Check(missing.Value.IslandAppearance == "liquidGlass", "The appearance default matches the Mac preference");
+            Check(missing.Value.ShowEmbeddedCodexSessions && missing.Value.ShowEmbeddedClaudeSessions, "Both independent embedding preferences default to visible");
+            var original = new DesktopPreferences
+            {
+                Language = "zh-Hans", Position = "topRight", DisplayMode = "notch", IslandAppearance = "classic", ExpandedQuotaStyle = "classic", PositionChosen = true, LastSettingsPane = "appearance", HideProjects = true, ShowAppButtons = false, ShowEmbeddedCodexSessions = false, RetentionMinutes = 60,
+                CodexHome = @"C:\中文 space\.codex", CodexExecutable = @"C:\tools 中文\codex.exe",
+                DeepSeekPanelStyle = "simple", DeepSeekMode = "budget", DeepSeekDailyBudget = 12.5, DeepSeekWeeklyBudget = 70,
+                DeepSeekRingPeriod = "week", DeepSeekSpeedSource = "account", DeepSeekShowsTurnCost = false, DeepSeekBalanceSource = "apiKey", DeepSeekProgressRing = false,
+                CompactLayout = "{\"version\":9,\"leading\":[\"firstOutput\",\"activity\"],\"trailing\":[\"quota\"]}",
+                CompactSingleTask = "count", CompactMetric = "pace", CodexQuotaWindow = "5h", ClaudeQuotaWindow = "7d", QuotaRingOuter = "claude", QuotaRingInner = "none",
+                ProviderModes = new() { ["codex"] = "disabled", ["claude"] = "automatic", ["deepseek"] = "disabled" }
+            };
+            Check(store.Save(original), "Valid preferences must save");
+            var restored = store.Load();
+            Check(!restored.Unavailable && restored.Value.Language == "zh-Hans" && restored.Value.Position == "topRight"
+                && restored.Value.DisplayMode == "notch" && restored.Value.ExpandedQuotaStyle == "classic" && restored.Value.PositionChosen == true && restored.Value.LastSettingsPane == "appearance"
+                && restored.Value.CodexHome == original.CodexHome && restored.Value.CodexExecutable == original.CodexExecutable
+                && restored.Value.DeepSeekPanelStyle == "simple" && restored.Value.DeepSeekMode == "budget" && restored.Value.DeepSeekDailyBudget == 12.5
+                && restored.Value.DeepSeekWeeklyBudget == 70 && restored.Value.DeepSeekRingPeriod == "week" && restored.Value.DeepSeekSpeedSource == "account" && !restored.Value.DeepSeekShowsTurnCost
+                && restored.Value.DeepSeekBalanceSource == "apiKey" && !restored.Value.DeepSeekProgressRing
+                && File.ReadAllText(file).Contains("\"deepseekProgressRing\": false") && !File.ReadAllText(file).Contains("deepSeekProgressRing")
+                && restored.Value.CompactLayout == original.CompactLayout && restored.Value.CompactSingleTask == "count" && restored.Value.CompactMetric == "pace"
+                && restored.Value.CodexQuotaWindow == "5h" && restored.Value.ClaudeQuotaWindow == "7d" && restored.Value.QuotaRingOuter == "claude" && restored.Value.QuotaRingInner == "none"
+                && restored.Value.ProviderModes["codex"] == "disabled" && restored.Value.ProviderModes["claude"] == "automatic"
+                && restored.Value.HideProjects && !restored.Value.ShowAppButtons && !restored.Value.ShowEmbeddedCodexSessions && restored.Value.RetentionMinutes == 60, "Unicode source choices, module modes and display preferences must survive relaunch");
+            // The collapsed bar's size, component choices and the new materials, under the Mac's keys.
+            var choices = new CompactChoices { MultiRing = "average", RingDim = false, WarningLimit = 0 }.ToJson();
+            Check(store.Save(original with { CompactBarSize = "large", CompactComponentOptions = choices, IslandAppearance = "graphite", CompactSingleTask = "percent" }),
+                "The bar size, component choices, graphite and the percent core must save");
+            var sized = store.Load().Value; string saved = File.ReadAllText(file);
+            Check(sized.CompactBarSize == "large" && sized.CompactComponentOptions == choices && sized.IslandAppearance == "graphite" && sized.CompactSingleTask == "percent"
+                && saved.Contains("\"compactBarSize\": \"large\"") && saved.Contains("\"compactComponentOptions\": \"" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(choices)) + "\""),
+                "Component choices are stored as the Mac's data and survive relaunch");
+            // The expanded panel's blocks and choices, also as the Mac's data; damage reads as unset.
+            const string panelLayout = "{\"blocks\":[\"claude\",\"tasks\"],\"version\":1}";
+            string panelOptions = PanelChoices.With(PanelChoices.With(null, "rowFields", new[] { "rate", "model" }), "pageSize", 5);
+            Check(store.Save(original with { ExpandedPanelLayout = panelLayout, ExpandedPanelOptions = panelOptions, LastSettingsPane = "expandedPanel" }), "The panel's layout and choices must save");
+            var panel = store.Load().Value; saved = File.ReadAllText(file);
+            Check(panel.ExpandedPanelLayout == panelLayout && panel.ExpandedPanelOptions == panelOptions && panel.LastSettingsPane == "expandedPanel"
+                && saved.Contains("\"expandedPanelLayout\": \"" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(panelLayout)) + "\"")
+                && saved.Contains("\"expandedPanelOptions\": \"") && System.Text.Json.Nodes.JsonNode.Parse(panelOptions)!["rowFields"]!.AsArray().Count == 2,
+                "The panel's layout and choices are stored as the Mac's data and survive relaunch");
+            var damagedPanel = System.Text.Json.Nodes.JsonNode.Parse(saved)!.AsObject(); damagedPanel["expandedPanelLayout"] = "not base64!"; damagedPanel["expandedPanelOptions"] = Convert.ToBase64String(new byte[] { 0xff, 0xfe });
+            File.WriteAllText(file, damagedPanel.ToJsonString());
+            var panelRecovered = store.Load();
+            Check(!panelRecovered.Unavailable && panelRecovered.Value.ExpandedPanelLayout == null && panelRecovered.Value.ExpandedPanelOptions == null
+                && panelRecovered.Value.CompactLayout == original.CompactLayout && panelRecovered.Value.LastSettingsPane == "expandedPanel",
+                "A damaged panel layout or choice reads as automatic and default without touching other settings");
+            const string damagedField = "{\"version\":1,\"multiRing\":\"segments\",\"paceTick\":\"yes\",\"warningStyle\":\"dot\",\"ringLayout\":\"future\",\"later\":[1,2]}";
+            var readBack = CompactChoices.Parse(damagedField);
+            Check(readBack.MultiRing == "segments" && readBack.WarningStyle == "dot" && readBack.PaceTick && readBack.RingLayout == "concentric",
+                "A damaged or unknown field reads as its default without resetting the other choices");
+            var oneChange = System.Text.Json.Nodes.JsonNode.Parse(CompactChoices.With(damagedField, "lowColor", false))!.AsObject();
+            Check(oneChange["lowColor"]!.GetValue<bool>() == false && oneChange["multiRing"]!.GetValue<string>() == "segments" && oneChange["warningStyle"]!.GetValue<string>() == "dot"
+                && oneChange["paceTick"]!.GetValue<string>() == "yes" && oneChange["ringLayout"]!.GetValue<string>() == "future" && oneChange["later"] is System.Text.Json.Nodes.JsonArray,
+                "Saving one choice keeps every other field as saved, even values this version cannot read");
+            Check(CompactChoices.Parse(CompactChoices.With("broken", "warningLimit", 0)) == CompactChoices.Default with { WarningLimit = 0 },
+                "Unreadable text starts the change from the defaults");
+            Check(CompactChoices.Parse(sized.CompactComponentOptions).MultiRing == "average" && CompactChoices.Parse("broken").MultiRing == "service"
+                && CompactChoices.Parse(new string('x', CompactChoices.ByteLimit + 1)) == CompactChoices.Default, "Choices parse per field and fall back when damaged");
+            Check(!store.Save(original with { IslandAppearance = "tinted" }), "The retired tinted material cannot be saved");
+            Check(store.Save(original with { IslandAppearance = "liquidGlassLight" }) && store.Load().Value.IslandAppearance == "liquidGlassLight", "Light Liquid Glass is a saved material");
+            Check(store.Save(original with { IslandAppearance = "graphite" }) && store.Load().Value.IslandAppearance == "graphite", "Graphite is a saved material");
+            Check(!store.Save(original with { CompactBarSize = "huge" }) && !store.Save(original with { CompactComponentOptions = new string('x', CompactChoices.ByteLimit + 1) }),
+                "Invalid sizes and oversized choices cannot replace saved settings");
+            var damagedChoices = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(file))!.AsObject();
+            damagedChoices["compactComponentOptions"] = "@@not base64@@"; damagedChoices["compactBarSize"] = "future-size";
+            File.WriteAllText(file, damagedChoices.ToJsonString());
+            var recovered = store.Load();
+            Check(!recovered.Unavailable && recovered.Value.CompactComponentOptions == null && recovered.Value.CompactBarSize == "standard"
+                && recovered.Value.IslandAppearance == "graphite", "Damaged choices and a future size fall back without losing the other settings");
+            Check(store.Save(original), "The original settings save again");
+            byte[] before = File.ReadAllBytes(file);
+            var independentlyHidden = original with { ShowEmbeddedCodexSessions = true, ShowEmbeddedClaudeSessions = false };
+            Check(store.Save(independentlyHidden) && store.Load().Value.ShowEmbeddedCodexSessions && !store.Load().Value.ShowEmbeddedClaudeSessions,
+                "Hiding Claude embedding cannot borrow or overwrite Codex's separate preference");
+            using (var config = JsonDocument.Parse(JsonSerializer.Serialize(independentlyHidden.EngineConfiguration())))
+                Check(config.RootElement.GetProperty("showEmbeddedCodexSessions").GetBoolean() && !config.RootElement.GetProperty("showEmbeddedClaudeSessions").GetBoolean(),
+                    "The acknowledged engine configuration carries both Mac preference keys independently");
+            // Every main-window page reopens where it was; older names are kept for the window to map.
+            foreach (string pane in new[] { "overview", "history", "general", "appearance", "collapsed", "notifications", "codex", "claude", "deepseek", "modules", "remote", "about", "support", "reminders", "connections", "help", "whatsNew" })
+                Check(store.Save(original with { LastSettingsPane = pane }) && store.Load().Value.LastSettingsPane == pane, "The settings page survives a save: " + pane);
+            Check(store.Save(original with { LastSettingsPane = "future-page" }) && store.Load().Value.LastSettingsPane == "overview", "An unknown page opens Overview, as on the Mac");
+            Check(store.Save(original with { LastSettingsPane = "harness.workbuddy", DisabledHarnessProgress = ["workbuddy"],
+                    HiddenTurnCredits = ["workbuddy"], HarnessHomes = new() { ["workbuddy"] = @"D:\WorkBuddyData" } })
+                && store.Load().Value is { LastSettingsPane: "harness.workbuddy", DisabledHarnessProgress: ["workbuddy"], HiddenTurnCredits: ["workbuddy"] } loaded
+                && loaded.HarnessHomes.GetValueOrDefault("workbuddy") == @"D:\WorkBuddyData",
+                "Local Harness page and progress settings survive a restart");
+            Check(store.Save(original with { AppTheme = "dark", AccentColor = "graphite" }) && store.Load().Value is { AppTheme: "dark", AccentColor: "graphite" }
+                && File.ReadAllText(file).Contains("\"appTheme\": \"dark\"") && File.ReadAllText(file).Contains("\"accentColor\": \"graphite\""),
+                "Theme and accent save under the Mac's keys");
+            Check(!store.Save(original with { AccentColor = "teal" }) && !store.Save(original with { AppTheme = "dim" }), "Unknown themes and accents cannot be saved");
+            Check(store.Save(original), "Restore the original saved fixture before rejected-write assertions");
+            Check(restored.Value.IslandAppearance == "classic" && JsonDocument.Parse(before).RootElement.GetProperty("islandAppearance").GetString() == "classic",
+                "The original appearance key and value survive relaunch");
+            Check(!store.Save(original with { IslandAppearance = "unknown" }), "An invalid appearance cannot replace saved settings");
+            Check(!store.Save(original with { CodexHome = "relative\\folder" }), "Relative data homes cannot replace saved settings");
+            Check(!store.Save(original with { RetentionMinutes = -1 }), "Invalid retention cannot replace saved settings");
+            Check(!store.Save(original with { DisplayMode = "unknown" }), "An invalid display mode cannot replace saved settings");
+            Check(!store.Save(original with { ExpandedQuotaStyle = "unknown" }), "An invalid quota style cannot replace saved settings");
+            Check(!store.Save(original with { CompactLayout = new string('x', 8193) }) && !store.Save(original with { QuotaRingOuter = "Foreign Ring!" })
+                && !store.Save(original with { CompactSingleTask = "foreign" }) && !store.Save(original with { CompactMetric = "foreign" })
+                && !store.Save(original with { CodexQuotaWindow = "bad\nvalue" }), "Invalid compact choices cannot replace saved settings");
+            Check(!store.Save(original with { DeepSeekPanelStyle = "unknown" }) && !store.Save(original with { DeepSeekMode = "unknown" })
+                && !store.Save(original with { DeepSeekDailyBudget = -1 }) && !store.Save(original with { DeepSeekWeeklyBudget = double.PositiveInfinity })
+                && !store.Save(original with { DeepSeekBalanceSource = "foreign" }),
+                "Invalid or nonfinite spending preferences cannot replace saved settings");
+            Check(before.SequenceEqual(File.ReadAllBytes(file)), "Rejected settings must leave the last valid file intact");
+            File.WriteAllText(file, "{\"schemaVersion\":1,\"position\":\"bottomRight\"}");
+            var legacy = store.Load();
+            Check(legacy.Value.ShowEmbeddedClaudeSessions, "An older profile without the Claude embedding key keeps sessions visible");
+            Check(legacy.Value.ClaudeProgressRing && legacy.Value.CodexProgressRing && legacy.Value.DeepSeekProgressRing,
+                "A profile that never saved a progress ring choice turns all three rings on, as on the Mac");
+            Check(legacy.Value.IslandAppearance == "liquidGlass", "A missing appearance uses Liquid Glass without rewriting the profile");
+            Check(!legacy.Unavailable && legacy.Value.HasChosenPosition && legacy.Value.DisplayMode == "automatic"
+                && legacy.Value.LastSettingsPane == "overview" && legacy.Value.ShowEmbeddedCodexSessions && legacy.Value.ExpandedQuotaStyle == "split"
+                && legacy.Value.DeepSeekMode == "balance" && legacy.Value.DeepSeekPanelStyle == "detailed" && legacy.Value.DeepSeekDailyBudget == null && legacy.Value.DeepSeekShowsTurnCost
+                && legacy.Value.DeepSeekBalanceSource == "automatic", "Older corner choices must remain explicit while new optional settings use defaults");
+            File.WriteAllText(file, "{\"schemaVersion\":1,\"position\":\"bottomRight\",\"expandedQuotaStyle\":\"future-style\"}");
+            var unknownStyle = store.Load();
+            Check(!unknownStyle.Unavailable && unknownStyle.Value.Position == "bottomRight" && unknownStyle.Value.ExpandedQuotaStyle == "split",
+                "An unknown quota style must fall back to Split Ring without discarding unrelated choices or rewriting the profile");
+            const string futureAppearance = "{\"schemaVersion\":1,\"position\":\"topRight\",\"islandAppearance\":\"future\"}";
+            File.WriteAllText(file, futureAppearance);
+            var unknownSurface = store.Load();
+            Check(!unknownSurface.Unavailable && unknownSurface.Value.IslandAppearance == "liquidGlass" && unknownSurface.Value.Position == "topRight"
+                && File.ReadAllText(file) == futureAppearance, "A future appearance falls back without losing other choices or rewriting the file");
+            File.WriteAllText(file, """{"schemaVersion":2,"providerModule.workbuddy":"enabled","providerModule.future-harness":"disabled","providerModule.bad?key":"enabled","providerModule.future-mode":"foreign"}""");
+            var modules = store.Load().Value;
+            Check(modules.ProviderModes.Count == 5 && modules.ProviderModes["workbuddy"] == "enabled" && modules.ProviderModes["future-harness"] == "disabled",
+                "Loading preserves valid module choices, including ones the engine does not support yet");
+            Check(store.Save(modules with { HideProjects = true }) && store.Load().Value.ProviderModes.OrderBy(pair => pair.Key).SequenceEqual(modules.ProviderModes.OrderBy(pair => pair.Key)),
+                "Saving an unrelated setting keeps registered and future module choices");
+            var hundred = new Dictionary<string, string>(modules.ProviderModes, StringComparer.Ordinal);
+            for (int i = 0; i < 100; i++) hundred["fixture-" + i] = i % 2 == 0 ? "enabled" : "disabled";
+            Check(store.Save(modules with { ProviderModes = hundred }) &&
+                store.Load().Value.ProviderModes.OrderBy(pair => pair.Key).SequenceEqual(hundred.OrderBy(pair => pair.Key)),
+                "A profile with a hundred more modules preserves every choice after relaunch");
+            foreach (string damaged in new[]
+            {
+                "not JSON", "null", "{}", "{\"schemaVersion\":3}", "{\"schemaVersion\":\"one\"}",
+                "{\"schemaVersion\":1,\"providerModes\":null}", "{\"schemaVersion\":1,\"retentionMinutes\":-1}",
+                new string('x', PreferencesStore.MaximumBytes + 1)
+            })
+            {
+                File.WriteAllText(file, damaged);
+                var fallback = store.Load();
+                Check(fallback.Unavailable && fallback.Value.IsValid && fallback.Value.Language == "system" && fallback.Value.HideProjects,
+                    "Malformed or future settings must fall back without crashing or revealing project names");
+                Check(File.ReadAllText(file) == damaged, "Loading must never rewrite a settings file");
+            }
+            return restored.Value;
+        }
+        finally
+        {
+            // This fixture creates files only in its own unique temporary directory.
+            if (Directory.Exists(root))
+            {
+                foreach (string entry in Directory.EnumerateFiles(root, "*", SearchOption.TopDirectoryOnly)) File.Delete(entry);
+                Directory.Delete(root);
+            }
+        }
+    }
+    private static void Check(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

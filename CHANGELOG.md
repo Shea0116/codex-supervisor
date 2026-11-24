@@ -1,0 +1,365 @@
+# Changelog
+
+## 4.6.2
+
+- Mac and Windows: In a Codex Desktop chat set to Approve for Me, a task no longer shows that it waits for your approval while Codex reviews the request itself. The alert used to appear for each such command and vanish a few seconds later.
+- Windows: A Codex chat that Codex's index records under an extended Windows path keeps its title instead of the project folder's name ([#276](https://github.com/RyanZhangNTU/codex-pacer/issues/276)).
+
+## 4.6.1
+
+- Mac and Windows: Local Codex tasks, their progress and approval requests show again after Codex 26.1117, which removed the connection Pacer read them from ([#275](https://github.com/RyanZhangNTU/codex-pacer/issues/275)). Pacer now follows Codex through Codex's own hooks, which you allow in Codex once.
+- Mac and Windows: After this update, and in the welcome guide for new users, two steps get Codex ready: update Codex if it's too old, then allow Pacer in Codex. **Open Codex** opens Codex's settings with a small guide beside them, and each step checks itself off when it's done. The update note opens only while the Codex module is on.
+- Mac and Windows: Every service page in Settings has the same layout: Status (task monitoring, account and usage), Display, usage settings where a service has them, and custom folders. Remote lists only SSH hosts and, on Windows, WSL; Codex's task tracking and Dot tasks moved to the Codex page.
+- Mac and Windows: If Codex runs tasks that Pacer doesn't hear about, the Codex page and the collapsed bar say so. The warning clears by itself once Pacer hears from Codex again.
+- Mac and Windows: A Codex that's too old asks you to update it, and Pacer checks again after Codex updates.
+- Mac and Windows: Remote Control is removed, because Codex 26.1117 no longer supports it.
+- Mac and Windows: SSH hosts added in Codex Desktop show their running tasks.
+- Mac and Windows: A Codex that quits or crashes in the middle of a task no longer leaves the task showing as running.
+
+## 4.6.0
+
+- Mac and Windows: Codex banked resets count down to their expiry. History shows how long until the next one expires and how long each deadline has left, in the attention color within three days ([#238](https://github.com/RyanZhangNTU/codex-pacer/issues/238)).
+- Mac and Windows: The expanded panel shows a capsule under Codex's quota with the resets you have and the next expiry. With other services beside Codex it alternates between the two. Clicking it opens History with the deadlines showing. It can be turned off in the Codex block of the Expanded Panel page.
+- Mac and Windows: Pacer reminds you before a banked reset expires, with a warning in the collapsed bar and, when system notifications are on, a notification. **Settings → Notifications** sets how many days ahead, three by default.
+- Mac and Windows: The expanded panel's header can show a **Return to Top Center** button while the island is moved freely. It is off by default; turn it on under **Expanded Panel → Buttons**.
+- Mac and Windows: When Claude Desktop asks for access to an app on your computer, the task shows that it waits for you instead of still running.
+- Mac and Windows: While a task waits for its own background work, the collapsed bar's status says so, as the task row does.
+- Mac and Windows: With the warnings item removed from the collapsed bar, the reminders that follow it, such as low credits, DeepSeek's alerts and expiring resets, no longer send notifications, as the Notifications page shows.
+- Mac and Windows: A Codex chat in which you edited an earlier message keeps its task and progress ring. Codex writes such a chat to a new file, which Pacer took for another chat's history, so on Windows the task disappeared and on Mac its ring stayed empty ([#259](https://github.com/RyanZhangNTU/codex-pacer/issues/259)).
+- Mac and Windows: A long Codex task keeps its progress ring to the end after writing a lot of output at once.
+- Windows: The collapsed bar's status words sit on its center line again instead of slightly lower and cut off ([#258](https://github.com/RyanZhangNTU/codex-pacer/issues/258)).
+- Windows: Dates and times follow your time zone instead of GMT, including reset and expiry times in History, chart labels and the week labels for DeepSeek and WorkBuddy ([#264](https://github.com/RyanZhangNTU/codex-pacer/issues/264)).
+
+## 4.5.2
+
+- Mac and Windows: Pacer reads the credits of a WorkBuddy enterprise member, the cycle quota their administrator assigns ([#241](https://github.com/RyanZhangNTU/codex-pacer/issues/241)). If that read fails, Pacer keeps the last reading instead of showing the personal account's credits, and the sign-in window waits for a valid reading.
+- Mac and Windows: WorkBuddy's credits card in Settings runs its lines to the card's right edge, in line with the breakdown below them, and no longer shows "Where to check account usage".
+- Mac and Windows: When Pacer takes its own setup out of Claude's settings file, by turning Claude off on Mac or uninstalling Pacer on Windows, it no longer removes environment settings you added there.
+- Windows: Claude's quota is read through the browser Pacer signs in to Claude with, so it works on networks where Claude's site asked for a verification check again after every sign-in ([#243](https://github.com/RyanZhangNTU/codex-pacer/issues/243)). If the site still blocks Pacer after you sign in, Pacer says to try another network or proxy instead of asking you to sign in again.
+- Windows: WorkBuddy's sign-in window no longer says the page could not load when the site moves on to its own login page, and signing in there completes.
+- Windows: Pacer's background engine no longer stops right after it starts on PCs where address randomization is turned off in Exploit Protection and a folder name has non-English characters.
+- Mac: DeepSeek's balance source menu can switch to an API key again.
+- Mac: When restarting WorkBuddy finds Pacer's progress tool already trusted, the floating guide says it's done instead of waiting two minutes.
+
+## 4.5.1
+
+- Mac and Windows: Pacer stays connected to the Codex app again after its 26.1111 update. That update changed how the Codex app reports a task's state, so Pacer kept reconnecting. Settings showed the local Codex source as "Not connected, retrying", approvals for Codex app tasks raised no alert, and Remote Control tasks didn't appear. Tasks, progress and quota were not affected. Pacer also reads later versions of these reports, so a similar Codex update shouldn't cut the connection again.
+
+## 4.5.0
+
+- Add WorkBuddy and its international edition, WorkBuddy AI, on Mac and Windows. Each is its own module with its own page, account, sign-in and data folder, and turns on once Pacer finds the app. Pacer follows their tasks and titles, shows what a task is doing and when it waits for you, and draws the progress ring, which is on by default. A small floating guide shows each click in WorkBuddy to turn the ring on, and asks to restart WorkBuddy when it needs to.
+- Show WorkBuddy account credits by how they behave. The plan's monthly credits refresh each cycle; rewards and top-ups lapse batch by batch at their own dates. The dial, its lines and the breakdown in Settings show the month, extra credits, the total and each refresh or expiry date. Credits also appear in the collapsed bar, the expanded panel, Overview and History, and each module can warn when credits run low or are about to expire.
+- Add the Module Library. The Settings sidebar lists only the services found on this computer or turned on; the **Module Library** page lists every service, with a **Get** link for the ones not found here. Onboarding folds them away the same way.
+- Codex tasks on SSH hosts, and in WSL on Windows, show their progress percentage. Pacer adds its progress tool to each host's Codex settings, never touches entries it did not write, and removes only its own when the ring is turned off. Tasks already running start reporting once Codex reconnects ([#231](https://github.com/RyanZhangNTU/codex-pacer/issues/231)).
+- SSH tasks come back as soon as the network does. After sleep, a display wake, an unlock or a VPN reconnect, Pacer retries the SSH hosts it could not reach instead of waiting out their backoff of up to 15 minutes.
+- The progress ring asks every agent in the same words to report whenever it makes progress, so rings move more steadily. Claude's progress switch has one mode; older settings are updated, on remote hosts too.
+- On a bar docked to the side of the screen, quota, balance and credits keep the full size of the numbers around them. Their %, ¥ or k sits under the number, a number keeps at most one decimal, and a long reading shrinks on its own instead of shrinking every value it takes turns with.
+- When Pacer can't check for or download an update, most often because the network can't reach GitHub, it says so, scheduled checks included: Overview shows a banner, Help & Updates a dot in the sidebar and, in its card, the time of the last successful check, Check Again, and three places to get the full installer to install over this version: the GitHub Release, pacer.bhgmz.com, which needs no GitHub, and the QQ group, with its number and code.
+- A Codex chat started outside a project shows the name Codex gives it while it runs, instead of its folder name. A model from another family keeps its brand in its short name, such as DeepSeek V4 Pro in a Codex task.
+- Windows: sign-in windows for Claude, DeepSeek and WorkBuddy say what signing in gives in a banner above the page, and close by themselves once the account is confirmed, with no Continue button. What's New for an offered update opens again; it read the installed build's notes, which the update feed no longer lists. Task updates that arrive in a burst are no longer missed: when several files changed at once, every change after the first could be read from the wrong place. DeepSeek Harness 0.2.2 and later are recognized again, so the panel shows its button and its tasks open it when clicked; these versions carry DeepSeek's own company name, which Pacer did not accept.
+
+## 4.4.4
+
+- On Windows, Codex tasks run outside the Codex app, such as in a terminal, update right away again instead of up to two minutes late. Task states and requests for your attention appear as soon as Codex writes them; speeds and token counts keep the panel's usual refresh.
+- On Mac and Windows, a Codex task that writes a very long output before it ends now shows as completed instead of "Status unconfirmed", and the first Codex task after midnight is found right away.
+- The Retry and Settings buttons under a quota ring are no longer cut off when three services are shown side by side. They stack when the column is too narrow for both ([#226](https://github.com/RyanZhangNTU/codex-pacer/issues/226)).
+
+## 4.4.3
+
+- Urgent fix for today's Codex update: tasks on SSH hosts show again. Codex now keeps its SSH connection settings under the signed-in account, so Pacer 4.4.2 and earlier found no SSH hosts. Pacer reads the current account's settings, still reads the older layout, and never uses another account's hosts.
+
+## 4.4.2
+
+- Use much less power in the background. With the same real tasks and the panel collapsed, Pacer used about 60% less CPU than 4.4.1 on Windows and about 65% less on Mac. Pacer no longer redraws or sends updates that change nothing on screen. It checks unreachable SSH hosts and failed connections less often, backing off to every 15 minutes, and stops rescanning apps it has already identified. On Windows, collapsed animations run at lower frame rates and stop while the screen is locked or off. On Mac, the Dot task check pauses while the screen is dark.
+- Codex Dot tasks have their own switch, **Include Codex Dot Tasks**, on the Remote page. It is off by default because checking Dot tasks uses more power. After this upgrade it stays on if Dot tasks already reported progress on this computer.
+- Codex Remote Control monitoring, and WSL monitoring on Windows, are off unless you turn them on in **Settings → Remote**. Windows turns WSL monitoring off once after this upgrade. WSL now follows distributions as they start and stop instead of scanning every 30 seconds, and **Refresh Now** checks them on demand.
+- A slow quota reply no longer shows an error. Codex, Claude and DeepSeek wait up to 30 seconds and keep the last reading, which is dimmed only after 10 minutes.
+- The collapsed bar keeps its width while the TPS readout changes between 0 and 999.
+
+## 4.4.1
+
+- Fix high disk reads and energy use on Macs where Codex can run Dot tasks. Every two minutes, Pacer 4.4.0 checked the signature of all of Codex, reading about 1.6 GB each time. It now checks only the Codex command-line tool it starts. On Mac and Windows, Pacer also keeps one connection for Dot tasks instead of reconnecting, and starting Codex's command-line tool, every two minutes. Dot tasks still appear as quickly as before.
+
+## 4.4.0
+
+- Customize the expanded panel on Mac and Windows. The panel becomes a column of blocks: the task list, Codex and Claude quota, DeepSeek's balance, where today's DeepSeek spend went and its last 7 days. The new **Expanded Panel** page adds, removes and drags them, and sets each block's options: tasks per page, one- or two-line rows and what each row shows, each quota's windows, style, arrangement, details and pace tick, DeepSeek's dial, peak hint, spend list and reference line, and which buttons sit in the header. Until you change anything, the panel follows the services you turn on; **Restore Automatic** returns to that.
+- In the Collapsed Bar and Expanded Panel libraries, clicking an item only selects it; the round button at its end adds or removes it. Settings stay available for an item that is not added and apply once it is.
+- Redesign the collapsed bar. Items share one drawing style and size, each item's options are on the Collapsed Bar page, the bar has four sizes, Appearance adds materials and an edge treatment, and the island remembers its place on each display.
+- Track Codex Dot Durable tasks assigned to this computer, labelled `Dot`, even while their chats are closed. Pacer shows their progress and ending; their speed is not available yet. Codex needs a restart the first time; on Windows this needs Codex Desktop from the Microsoft Store.
+- The What's New note keeps each explanation behind ⓘ and links to the page a new setting lives on.
+- Codex: the progress ring works with third-party APIs, whose models could hide Pacer's progress tool behind tool search.
+- Claude Code: a subagent revived with `SendMessage`, or a background subagent its main conversation outlived, no longer keeps its task on **Working on a task**. Pacer coexists with existing and organization-managed telemetry settings, steps aside only on a real conflict and returns when it clears.
+- Windows: fix an engine crash on Windows 10 while Pacer looked for the process writing a session file. If the engine stops, it writes a short crash report without paths or private content that can be attached to an issue.
+
+## 4.3.2
+
+- Windows: fix the engine stopping after Pacer had run for about 15 hours, which stopped task updates until Pacer was reopened. Short background commands, such as the WSL check every 30 seconds, each left a file descriptor open, and after about 8,000 of them the engine could not start another command and stopped. If the engine stops unexpectedly after running for at least 10 minutes, Pacer now restarts itself. The engine also no longer keeps a handle for every finished web request, which added about a dozen a minute while Pacer followed Claude in the cloud.
+- Claude cloud Projects: a question you already answered no longer returns as a new alert after Pacer skips a read or the thread leaves the current page, and recent unread questions appear when Pacer connects without a new notification. A finished turn that you can continue shows **Turn finished · Reply if needed**, and a session starting or stopping brings the next check forward.
+
+## 4.3.1
+
+- Mac: fix a memory leak that kept growing while Pacer followed tasks in the Codex desktop app.
+
+## 4.3.0
+
+- A new main window on Mac and Windows. Settings becomes Pacer's main window, with a sidebar, an Overview of every service and a History page. Updates download and install in place, Appearance adds a theme and an accent color, the Collapsed Bar is arranged on a live preview, and the welcome guide has four short pages.
+- Task progress rings for Codex, Claude Code and DeepSeek Harness, on by default. Each service reports how much of your request is done, drawn around the task's icon. The ring waits while background work runs and fills when the request ends. Claude sessions on SSH hosts, and in WSL on Windows, get it too. Turn it off per service in its settings.
+- New task icons. A comet circles until the first estimate, light runs along the arc while the task works, and a task that needs you or has ended fills a solid disc. When one task reports progress, the collapsed badge shows it.
+- Windows: the engine no longer keeps a processor core busy while Pacer is signed in to Claude.
+
+## 4.2.5
+
+- Windows: fix opening Claude tasks from the island after a recent Claude update.
+
+## 4.2.4
+
+- Drag the island by its status bar on the Mac and on Windows. It stays where you drop it, snaps to a screen edge when you release it nearby, and opens toward the free side of the screen. Free Move replaces the fixed custom positions in Appearance, which also offers Return to Top Center.
+- Only the open island's toolbar buttons show hover tooltips. Other island elements keep their descriptions for screen readers.
+- The welcome guide explains hover, leave and drag side by side, and Help has a row for moving the island.
+- A Claude Code subagent that finishes while its chat is busy now ends; its notification arrives as a queued attachment, which Pacer did not read. A background subagent's progress and speed keep updating after its chat starts another turn, and its own request timing counts toward the speed.
+- Windows: the "SSH host disconnected" reminder can be enabled and also reports a Codex SSH helper that exited; the engine uses the user's time zone instead of UTC, so Codex sessions started after local midnight appear immediately; the install folder no longer contains the preview guide or Demo.cmd.
+
+## 4.2.3
+
+- Improve Windows updates. Updates now open in Pacer's own window, in the Settings style, with readable release notes and real download progress, replacing WinSparkle. The installer follows the Windows display language, offers a desktop shortcut, the Start menu and launch on its finish page, and removes files the new version no longer ships. Later updates download only the files that changed when the installation matches the previous release, and fall back to the full installer otherwise. Finished update downloads are deleted, and uninstall also removes the install folder.
+- Fix the Windows Settings display picker, which showed a type name instead of each display's name.
+
+## 4.2.2
+
+- Add Codex Pacer for Windows, with the Mac's island, task list, quota rings, reminders and Settings for Codex, Claude Code and DeepSeek Harness, including SSH hosts, WSL and Codex Remote Control. It needs Windows 10 2004 (build 19041) or later on x64 or ARM64; Windows 11 22H2 and later get the glass surface. Each release carries x64 and ARM64 installers that install per user and update from **Settings → General**. They are not code signed yet, so SmartScreen asks once (**More info → Run anyway**).
+- Finish Claude and DeepSeek sign-in without a Continue click. Many people closed the window after signing in, which dropped the completion, so quota or balance never appeared. The sign-in window now shows a strip in the provider's color that says what signing in shows, with **Refresh** and **Later**; a new session turns it green and closes the window after 1.5 seconds, and closing it any other way completes while a session is present.
+- Fix Claude Code tasks that stayed marked as running after a skill that runs in its own agent, such as `/code-review`, had finished. Such a skill reports its agent differently from the Agent tool, so Pacer never saw that agent end. It now ends when the skill returns; a skill started in the background ends when Claude reports it finished.
+
+## 4.2.0
+
+- Show Claude's cloud Projects in the task list. Each thread that is working, waiting for you or just ended gets its own row with a cloud icon and the project's name, and the project's coordinator gets a **Project coordinator** row while it answers. Pacer reads them with the claude.ai session in its own window, the one Claude quota already uses, and **Settings → Claude → Show Claude cloud Projects** turns them off. **Settings → Connections** lists the source, paused without that sign-in.
+- Word these rows the way Projects work: **Working** while a thread runs, with a count when more sessions share it; **Coordinating**; **Decision needed**, **Reply needed** and **Approval needed**; **Resolved** or **Turn finished** at the end, and **Task failed**.
+- Remind when a thread or coordinator ends, including a run too short for Pacer to see working and one that ended while the Mac slept. A thread stays **Working** through a long tool call. A coordinator that hands work to threads or reports on one that just ended stays quiet, so each run reminds once. A resolved thread you read in Claude clears its card here, and a question you read and leave unanswered stops asking.
+- Click a row to open that thread or Project in Claude Desktop, or on claude.ai without it. A thread Desktop runs on this Mac stays the ordinary local task it already was.
+- Pacer checks Projects every 20 seconds while something runs and up to every 2 minutes otherwise, and a new run in a recently active Project appears within about 10 seconds. While a thread writes a reply, its row shows an estimated speed, which does not update during thinking or tool calls. A thread's ending card shows that turn's real speed and time to first output; the coordinator has neither.
+
+## 4.1.0
+
+- Add daily and weekly DeepSeek budgets. **Settings → DeepSeek → Mode** switches between **Balance** and **Budget**; Budget fills in both amounts from the last seven days' daily average plus a fifth (¥10 and ¥50 before there is any spend), and switching back keeps them without counting them. In Budget mode the expanded dial splits like Codex's 5 hours and week: today on the upper arc and this week on the lower one, each with the amount left, a pace tick, reset and forecast. Budgets count from midnight and from Monday 00:00. Pacer only reminds; it never blocks a request.
+- Let each collapsed quota ring show any enabled module, chosen with **Outer** and **Inner** inside Collapsed Bar's quota rings row. DeepSeek can take a ring to show today's or this week's budget left, and its value then shows the same amount. With DeepSeek alone and no budget ring, a price clock takes the rings' place: peak hours outside, the hours that cost money today inside and a hand at now. It is also its own component. The optional **×2** peak mark is removed.
+- Reconcile the DeepSeek balance with the local estimate. Pacer keeps eight days of balance readings, amounts and times only; a drop between readings is what the account was charged wherever it happened, so spend no task on this Mac accounts for, such as web searches, background requests or another device, appears as **Not on this Mac** and counts toward today's spend, the week and budgets.
+- Show one DeepSeek alert at a time on the collapsed bar, most urgent first: balance used up (solid **¥**), a spend spike (solid flame), a budget exceeded (solid **D** or **W**), a low balance (outlined **¥**) and 80% of a budget (outlined **D** or **W**). Set the lines in **Settings → Reminders**; an empty field uses an automatic line shown as its placeholder: the platform's alert line or ¥10 for the balance (the three-days-left rule is gone), and three times a busy 10 minutes of the last seven days, at least ¥5, for spikes. Notifications offer **Top Up**, or **Open Harness** and **Not for an Hour** for a spike; budgets notify at 80% and when exceeded.
+- Rework the DeepSeek-only panel. Beside the day or budget dial sit Today, Speed (what each 10 minutes of the last two hours cost, with the spike line) and Where it went (the two largest tasks, the rest and Not on this Mac, with a link to the platform's usage page); below it, 7 days against your daily budget or average. Each block shows only when it has data, and a **×2 until** chip marks peak hours. **Settings → DeepSeek → Expanded Panel** chooses Detailed or Simple, and **Speed → Count** chooses whether speed and spikes follow this Mac's estimate or the account's charges.
+- Estimate DeepSeek costs more closely: China's 2026 public holidays are off-peak, web searches and fetches add ¥0.005 each from 1 November 2026, sub-agent spend counts toward the task that started it, and third-party channels get no estimate. Ended tasks keep their names in Where it went.
+- Split the collapsed badge's orbit evenly between the services that are running: halves for two, thirds for three.
+- Rewrite Help as one sentence per entry, with a Codex, Claude and DeepSeek switch for each module's details.
+- Fix the collapsed quota number looking blurry on Retina displays, and the collapsed bar staying wider than needed after a setting changed.
+
+## 4.0.0
+
+- Add a DeepSeek Harness module beside Codex and Claude Code. Pacer reads Harness's own session logs on this Mac (`~/.dsh`, or `DSH_HOME`), which are compressed with Zstandard, and shows each session's stage, output speed, time to first output, turn time, model and reasoning effort, approvals and questions that wait for you, and how each turn ended, with completion cards, reminders and notifications like the other services. Only token counts and timing are kept; message text, reasoning and tool arguments are dropped while reading. A session left running when Harness quit becomes unconfirmed. Clicking a DeepSeek task brings Harness forward, since it has no link to a single conversation. The module turns itself on when Harness is installed and has its own Settings page, welcome card and app button. Harness sessions on SSH hosts are not followed yet.
+- Show each DeepSeek turn's estimated cost before the model name, such as **≈¥0.42**, from its tokens and DeepSeek's published prices, doubled on Beijing weekdays 09:00–12:00 and 14:00–18:00. Public holidays are not known. Turn it off in **Settings → DeepSeek**.
+- Read the DeepSeek balance the way Harness signs in. With a DeepSeek account, sign in to the DeepSeek platform once in Pacer's own window; the session stays in Pacer's private WebKit storage and reads only the wallet amounts, the platform's token estimate and its alert line. With an API key, paste a key in Settings; it is kept in your login keychain and sent only to the balance endpoint. Pacer never reads Harness's own credentials. **Balance source** in Settings can override the automatic choice.
+- Draw DeepSeek's quota ring as a day dial: today on a 24-hour face with each hour's spend, amber arcs over the doubled-price hours, the current time and the balance with today's spend in the middle. With DeepSeek alone, Now, Today and Balance details sit beside it, above the last seven days of spend split into off-peak and peak. The expanded section is called **Quota & Balance**, or **Balance** with DeepSeek alone.
+- Add the DeepSeek balance to the collapsed bar's alternating value; with DeepSeek alone, the bar shows the balance and today's spend. Add a low-balance warning (an outlined **¥**, solid when used up), on by default, and an optional blue **×2** while a DeepSeek task runs at peak price. The balance counts as low below the platform's alert line, or Pacer's own line (¥10 by default) when the platform has none, or with under three days left at the recent average; a system notification marks each crossing.
+- Show the welcome guide again for 4.0, with a DeepSeek card that offers sign-in or a key as needed.
+
+## 3.3.0
+
+- Show each task's model and reasoning effort in the expanded island, right-aligned below the output speed in the service's color, for example **GPT-6.1 Sol High** or **Opus 5.5 XHigh**. Known Codex and Claude model identifiers are shortened, the full identifier appears when you hover, and effort levels are translated. Codex reads them from the turn's session log or the Codex app, and Claude Code from its conversation records, on this Mac, SSH hosts and Remote Control. A model is shown only for the turn that used it: a model change in the middle of a turn waits for the next one, and the row shows the service name until the model is known.
+- Rework the task row's two lines without making it taller. The first line holds the title, limited so a long one can no longer widen the panel, then the speed and the turn time: counting up while the turn runs and showing how long it took once it ends. The second line holds the status, running agents and source, with a server icon for remote hosts. Time to first output moves to the speed's tooltip.
+- Draw status icons as plain outlines without a tile. Endings you have already seen fade back, while unread endings, tasks waiting for you and failures keep their color, so the unread dot is no longer needed.
+
+## 3.2.4
+
+- Fix Claude tasks that could stay marked as running after Codex Pacer restarted, such as after an update. On restart Pacer reads its hook records in batches, and could reach a conversation's ending while an older batch still named the previous turn; it dropped that ending, and the next batch reopened the finished turn. Hook records are now read in full first, as they already were for SSH hosts. A task that was actually cut off shortly before a restart is checked again once its last activity is 15 minutes old instead of staying running.
+
+## 3.2.3
+
+- Default to the new Split Ring layout while retaining the original dashboard as **Classic** in **Settings → Appearance → Expanded Quota**. Switching applies immediately and the choice survives relaunch.
+- Combine each service’s expanded quota windows in one ring: a shorter upper arc for 5 hours and a longer lower arc for 7 days, each with its own percentage, reset countdown and pace tick. Accounts without a 5-hour limit get a weekly gauge that opens at the bottom with **7d** in the opening, so a full ring never closes on itself. Codex-only accounts without a 5-hour limit now use it too; the quota bars remain for nonstandard limits and in Classic.
+- With only one service enabled, place its ring on the left and its pace, reset time and forecast on the right. The forecast extends the spending so far to the reset and turns amber when quota would run out first. Weekly-only accounts show the same details as three rows: pace, reset and forecast.
+- Keep missing and stale quota independent for each period. When a period has 15% or less left or is spending too fast, its label and percentage turn amber, for 7 days as well as 5 hours; the 5-hour arc also turns amber.
+
+## 3.2.2
+
+- Add a button for each enabled service's desktop app to the expanded island's task header, beside **Mark All as Read**, in the service's color. A click brings Codex or Claude forward, launching it if needed, even when that service has no task, and opens no conversation. A service whose desktop app isn't installed shows no button. Turn the buttons off with **Show App Buttons** in Settings → General; they are on by default and the switch is also offered in the 3.2.2 What's New note.
+- Smooth the task badge's orbit when Codex and Claude run at the same time. Claude's arc used to blur ahead of its head and look twice as long as Codex's; both arcs now have a sharp head and the same shape. Each service keeps its own place on the ring, so one starting or stopping no longer makes the other jump half a turn, and an arc now grows in or fades out over about a third of a second instead of appearing or vanishing at once. The rotation no longer restarts when the badge switches between a task count and a stage icon.
+
+## 3.2.1
+
+- Add **Mark All as Read** next to the pin in the expanded island. One click clears every unread ended task on all pages, and cleared tasks stay cleared after a restart. Tasks that are running or waiting for a reply or approval, and sessions hidden in Settings, are left alone.
+- Add **What's New** to Settings, above Help. It lists the highlights of every update since 3.1.0, newest first, with the same switches as the update note and a link to the full release notes.
+- Fix Claude Desktop tasks that sometimes stayed marked as running after the reply finished. Desktop can save a record before the one it follows, such as an attachment before its tool result, so Pacer could not tell which prompt the final reply and its stop belonged to. Pacer now links them once the missing record arrives, even when it lands after the reply, and the task ends normally. This applies to local and SSH sessions alike; an ending from an earlier prompt still cannot end a newer one.
+- Fix Codex Desktop questions that sometimes showed no reminder when Codex stopped sending live updates to Pacer. Pacer now also picks up the question from Codex's local session log, and the reminder clears once you reply or the turn ends. A question that moves between the two sources keeps a single reminder, and each new question still gets its own. Approval requests still rely on live updates.
+
+## 3.2.0
+
+- Replace the Automatic, Notch and Floating choices in Settings → Appearance with **Notch** and **Custom**. Custom places the island yourself under **Screen Position**: centered below the menu bar as before, or docked at any of the four corners as a narrow vertical strip whose long edge lies against the side of the screen, 10 points from the top or bottom. Choosing Custom over the notch starts at bottom left; a Mac that already floated keeps the centered bar.
+- Stack the collapsed components in the docked strip, with each number on its own line above its unit so nothing is wider than an icon. The top and bottom groups stay at the strip's ends, and the panel opens beside it, aligned with the strip's top or bottom edge.
+- Fix Claude Desktop tasks staying marked as running after the next-step box ends a turn. The task now shows as finished with a reply reminder until you answer, and sends one notification instead of two.
+
+## 3.1.2
+
+- Open a task in the app that started it. Claude tasks started in a terminal or an editor, and Claude or Codex tasks from apps that embed them, such as a Zotero plugin, show that app's name; clicking one switches to the app and relaunches it if it quit. Claude Desktop sessions still open in Claude Desktop, Codex tasks in the Codex app, and Claude sessions on SSH hosts still resume in Terminal.
+- Stop resuming local Claude tasks in a new Terminal window or importing them into Claude Desktop. Pacer can only identify the app while a task runs; when it doesn't know, the click says so.
+- Add **Show Claude Sessions from Other Apps** and **Show Codex Sessions from Other Apps** to Settings → Claude and Settings → Codex, on by default and offered once in the 3.1.2 What's New note. Turning one off hides those sessions, with their agents, questions and completion cards, until it is turned back on.
+- Never show translation requests from the Zotero Agent plugin, which have no conversation to open.
+- Fix answered Claude questions and approvals staying marked as waiting.
+
+## 3.1.1
+
+- Fix several bugs and improve overall stability.
+- Make Remote Control task monitoring more reliable during long conversations.
+- Show device names and clearer online, offline and waiting states for Remote Control connections.
+- Keep completed remote task cards read after opening their conversations, including after a restart.
+
+## 3.1.0
+
+- Add Open at Login to Settings → General and the welcome guide. macOS keeps the choice in Login Items; when macOS still needs approval, Pacer says so and opens Login Items.
+- Show a short What's New note once after an update, with any new setting it introduces. A fresh install sees the welcome guide instead.
+- Fix ended Codex child tasks appearing to run again when an older parent status arrives. A newer activation can still start the child normally.
+- Keep ended child tasks ended after Pacer reconnects to Codex, wakes from sleep or relaunches during the parent task, and release the parent's child states as soon as its turn finishes, so a finished conversation no longer stays marked as running.
+- Keep parent status hints separate from the local log cache, so removing a running hint restores the task's recorded state without requiring another log write. Confirmed endings remain effective after the parent subscription closes.
+
+## 3.0.1
+
+- Sign Codex Pacer with Developer ID and notarize it with Apple, so a new install opens after the standard macOS confirmation without **Open Anyway** in System Settings. Installed 3.0.0 copies update in place as before.
+- Notarize releases through a `notarytool` Keychain profile only, so the release scripts never handle the Apple password.
+
+## 3.0.0
+
+Codex Pacer now follows Claude Code as well as Codex.
+
+### Claude Code and modules
+
+- Show Claude Code tasks from this Mac and SSH hosts next to Codex tasks, with stages, replies and approvals that need you, endings, spawned agents, output speed and time to first output from Claude Code's own telemetry.
+- Show Claude quota for its 5-hour and 7-day windows, from Claude Code's status line or a claude.ai session in Pacer's own sign-in window, with an explicit choice when an account has several organizations. Pacer never reads other apps' Keychain items or browser cookies.
+- Make Codex and Claude independent modules. Each turns on automatically when its app or CLI is installed; an explicit choice sticks until you restore automatic detection.
+- Set up Claude Code monitoring automatically: Pacer adds its own hooks and a local-only telemetry endpoint next to existing settings, on this Mac and on connected SSH hosts that have Claude Code, and removes the local entries when the module is turned off by hand.
+- Follow the SSH hosts managed in Codex and Claude, including Claude Desktop's saved connections and their ports and identity files, so hosts no longer need to be added in Pacer.
+- Add Codex Remote Control tasks through the connected Codex app ([#77](https://github.com/RyanZhangNTU/codex-pacer/pull/77)). An idle Remote Control connection shows as waiting for a session.
+- Open Claude tasks in their Claude Desktop session, or resume them in Terminal.
+
+### The island
+
+- Merge the status icon and task count into one activity badge: an orbit in each provider's color while tasks run, solid amber when a task needs you, and marks for unread endings.
+- Show both services' quota in rings with a white pace tick and an Ahead, On pace or Fast verdict, the 5-hour window below each ring and a compact reset countdown. The collapsed bar alternates one quota value beside rings that show both.
+- Collect the 5-hour, SSH and quota-delay warnings into one warnings slot that appears only while a warning applies.
+- Show each running turn's elapsed time, and right-align speed and time to first output in two-line task rows.
+- Fit the island to its content at all times: around a notch the collapsed bar keeps equal sides sized by its components, and the expanded panel fits its task rows. The Specified Width option is gone.
+- Use Liquid Glass that follows the system's glass setting on macOS 26 and later, with a dark wash for legibility. Around the notch the collapsed bar stays black to blend with the camera.
+- Keep an ended task's card dismissed after a normal relaunch once you have opened its conversation.
+- Remove the menu bar item and the in-island reminder banner; everything shows on the island.
+
+### Settings
+
+- Move Settings into a sidebar window that applies changes as you make them, without Save or Cancel.
+- Customize the collapsed bar with a lane strip shaped like the bar: drag components between the sides of the camera, toggle each one, and choose 5 hours or 7 days for each service's quota.
+- Simplify Reminders to the collapsed-bar warnings, one System Notifications switch and how long ended tasks stay.
+- Add a Connections page that lists every task source with problems first, quota freshness, and the SSH and Remote Control switches.
+- Add a Help page with a legend drawn from the real island components, and a two-step welcome guide on first launch that can be reopened from Help.
+- Give Pacer its own icon.
+
+### Fixes and performance
+
+- Reduce Claude hook overhead, repeated directory scans, transcript parses and unchanged reads.
+- Reject measurements from a previous turn, keep tool endings when results contain display fields, and keep unknown quota visibly distinct from zero.
+- Treat a reachable SSH host without Claude as connected, and stop reporting missing Claude sources as SSH problems.
+- Fix the demo mode showing Codex quota as unavailable when Claude was last selected in Settings.
+
+### Upgrading
+
+Preferences from 2.x carry over. Saved layouts, quota windows and warnings are migrated, and retired options (menu bar, glass style and tint, specified width, per-kind reminders) are cleared on the next settings change.
+
+## 2.4.0
+
+- Customize the single-line collapsed bar with task/performance/quota/warning categories, drag ordering, left/right placement and a live preview; apply with one Save action, cancel changes or restore defaults.
+- Fit adaptive collapsed width to the visible components while preserving the hardware camera gap, expanded task/quota layout and existing collection frequency.
+- Fix Python 3.6 SSH log timestamp parsing, isolate failed scans from healthy subscriptions, and prevent recurring helper errors from spinning without heartbeats.
+- Use a numeric task badge, retain the latest TTFT in seconds, consolidate quota/pace labels and percentages, and show low-quota, delayed-update and SSH warnings only on issues.
+
+## 2.3.2
+
+- Preserve pending model-response timing across nested tools so delayed usage cannot divide a full request's output by the gap between tools.
+- Apply authoritative request-log corrections to retained TPS and prevent older runtime caches from restoring an inflated value; preserve the original freshness timestamp.
+
+## 2.3.1
+
+- Group spawned agents under their parent conversation, show the running descendant count and add the available parent/child TPS without duplicate task rows or totals.
+- Recognize Desktop subAgentActivity and runtime collaboration metadata; keep only thread relationships and status, with bounded discovery and log reads.
+- Ignore copied ancestor history in forked agent logs so it cannot replace the child identity, seed its rate or suppress its exact usage.
+- Retain each chat's last measured TPS across tools and new turns; use white for measurements updated within 15 seconds and gray afterwards, without a tilde. Reset accounting baselines independently.
+- Keep first-output latency stable within a turn across partial reads and source replacement; retain SSH text-presence markers, recover complete log timing windows and import service-reported timing.
+
+## 2.3.0
+
+- Show settled per-request output throughput using authoritative usage, including reasoning once and excluding tool waits; supplement local and SSH streams with bounded, incremental request logs.
+- Display observed first-output latency in each task and retain the last measured response through sparse usage reports and completion.
+- Automatically coalesce ordinary updates at five seconds collapsed and one second expanded; flush pending data on expansion and handle first output, tool waits, lifecycle and attention immediately.
+- Settle usage before a same-batch completion, keep metric-only updates independent of task lifecycle, and show global total TPS by summing available rates across active chats.
+
+## 2.2.2
+
+- Click the available-reset count to view exact expiry times, including deadlines beyond the weekly chart; distinguish unknown expiry details and non-expiring resets.
+- Exclude ephemeral conversations from task and input-reminder lists, preventing duplicate entries that cannot open; preserve normal input and approval reminders.
+- Apply remote session-name updates to running tasks and retained completion cards, including automatic naming after the first turn; preserve known names when live metadata is incomplete.
+- Keep status text and token rates fully visible in adaptive Notch mode on displays without a camera gap.
+
+## 2.2.1
+
+- Support custom and adaptive width modes.
+
+## 2.2.0
+
+- Flush queued SSH completions before disconnect, discover later loaded tasks through bounded pagination, and prevent retired-turn events or stale fallback logs from overriding current state.
+- Recognize live SSH tasks without a fallback log when the host alias contains dots, including IP-address aliases.
+- Keep completion reminders when a completed subscription has been released and a later unload/error status arrives.
+- Preserve active turns and their endings when start timestamps are missing; notify once for short live turns completed within one UI batch, and normalize collaboration-tool wait states across local and SSH sources.
+- Seed output-rate counters independently for each turn, accumulate rapid updates, and expire stale numbers after 15 seconds without extra polling; prevent cached usage and delayed previous-turn reports from inflating new-turn speed.
+- Discover new Desktop/SSH tasks from routing-index changes even when the owner emits no new following announcement.
+- Run the usual local Desktop event subscription natively, skip transcript bodies and release historical item storage to reduce collection overhead.
+- Retain five-minute weekly curve samples and coalesce normal cache writes over thirty minutes; flush on account/cycle changes, sleep and orderly exit.
+- Keep nonblocking questions visible while a task continues running, observing both server requests and Desktop message questions for local and enabled SSH sources.
+- Use approved native status icons with explicit task/reply/approval labels; show pending attention in matching task rows and keep quota warnings on the right.
+- Show the current stage for a single running task and a task count for multiple tasks.
+- Use Desktop hints and remote runtime-index changes to discover SSH activity, including when no Desktop owner announces a new turn; confirm states through the runtime and retain explicit completion reminders.
+- Preserve a metadata-confirmed new turn when its first item supplies the turn ID, so an older completed log cannot hide running state or the next completion reminder.
+- Keep the next turn in an open local conversation visible immediately, clear asynchronous reminders on steering replies, and preserve event order through connection shutdown.
+- Preserve completion reminders across reconnects and failed conversation opens, exclude internal reviews, bound fallback transport, and improve CLI/application discovery and saved quota-window handling.
+
+## 2.1.4
+
+- Name the SSH source when one connection is unavailable, and show the number of disconnected SSH sources when there are several.
+- Open Settings from the connection notice and list each disconnected SSH source in Data Sources.
+
+## 2.1.3
+
+- Restore the island's window level before its frame after dismissing update UI, keeping Notch mode attached to the screen's top edge.
+- Retain the update-dialog focus and interaction fixes from 2.1.2.
+
+## 2.1.2
+
+- Keep update dialogs and installation controls accessible when the island is expanded or pinned.
+- Collapse the island immediately and suspend its hover, pin and focus actions while update UI is open; restore normal interaction when the update is dismissed, cancelled or finished.
+- Leave the island undisturbed during background checks that do not show an update.
+
+## 2.1.1
+
+- Add English and Simplified Chinese throughout the interface, with automatic macOS language selection and a language override in Settings.
+- Add signed in-app updates with Sparkle: daily automatic checks, manual installation, and a Check for Updates entry in Settings and menus.
+- Generate and verify signed update feeds during release packaging; publish only after both the feed and installer upload successfully.
+- Add Automatic, Notch, and Floating display modes on every monitor, including non-Retina displays.
+- Keep Notch mode attached to the top edge on monitors without a physical notch, without reserving a camera gap.
+- Preserve existing display preferences when upgrading.
+- Size the expanded panel to its content, including source and account notices.
+- Page task lists three at a time, keeping the quota section in place while navigating.
+- Discover CLI installations in relocated Codex apps and common Node/package-manager locations, and prepare their runtime PATH for GUI launches.
+- Show actionable quota failures inline, including startup errors, RPC details and authentication-mode mismatches; add CLI discovery and connection testing in Settings.
+
+## 2.0.0
+
+- Replace the main-branch React/Tauri app with the native macOS island.
+- Show local/SSH task stages, output-rate estimates, account quota, pacing and the current seven-day curve with banked-reset expiry annotations.
+- Retain ended-turn cards with configurable reminders and add reliable quit controls.
+- Support native Liquid Glass, optional menu-bar visibility and display/privacy settings.
+- Preserve native preview preferences and caches when migrating to the production identity.
+- Remove obsolete implementations, tests, experimental documents and in-app calculation explanations; retain meaningful native regressions.
+- Ship a signed/notarized universal macOS DMG and Chinese promotional assets.
+
+[Earlier versions](https://github.com/RyanZhangNTU/codex-pacer/releases) remain available with their tagged source.

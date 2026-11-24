@@ -1,0 +1,904 @@
+import XCTest
+@testable import PacerCore
+
+final class ClaudeSubagentLifecycleTests: XCTestCase {
+    private let parent = "fixture-parent", turn = "fixture-turn", child = "fixture-child"
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private func send(_ kind: String, to state: inout ClaudeActivityState, thread: String? = nil, at offset: Double, extra: [String: Any] = [:], attaching: Bool = false) {
+        var row: [String: Any] = ["kind": kind, "origin": "hook", "sessionId": thread ?? parent, "promptId": turn, "at": now.timeIntervalSince1970 + offset]
+        if let thread, thread != parent { row["parentId"] = parent }
+        state.consume(ClaudeActivityRecord.encode(row.merging(extra) { _, new in new })!, now: now.addingTimeInterval(100), attaching: attaching)
+    }
+    func testForegroundAgentResultCompletesOnlyExactChildWhileBackgroundAndBlockedStopRemainRunning() throws {
+        for host in [String?.none, "remote-ssh-discovered:fixture"] {
+            var state = ClaudeActivityState(sourceID: host)
+            send("prompt", to: &state, at: 0)
+            send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+            send("subagentStart", to: &state, thread: child, at: 2)
+            send("subagentStart", to: &state, thread: "background-child", at: 2)
+            send("stopRequested", to: &state, thread: child, at: 3)
+            send("stopVerified", to: &state, at: 4)
+            XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+            XCTAssertEqual(state.activities.first { $0.threadID == "background-child" }?.phase, .running)
+            for invalid: [String: Any] in [["agentStatus": "async_launched"], ["itemId": "unobserved-tool"], ["agentId": "agent-" + child], ["promptId": "older-turn"]] {
+                send("agentResult", to: &state, at: 5, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "completed"].merging(invalid) { _, new in new })
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+            }
+            send("agentResult", to: &state, at: 6, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+            XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+            XCTAssertEqual(state.activities.first { $0.threadID == "background-child" }?.phase, .running)
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .completed)
+            XCTAssertEqual(state.activities.count, 3)
+        }
+    }
+    func testInternalHookWithoutSpawnNeverAppearsAndLaterRealSpawnKeepsParent() {
+        var state = ClaudeActivityState()
+        send("prompt", to: &state, at: 0); send("stopVerified", to: &state, at: 1)
+        for (index, kind) in ["metadata", "toolStart", "toolEnd", "stopRequested", "approval"].enumerated() {
+            send(kind, to: &state, thread: "internal-child", at: Double(index + 2), extra: ["itemId": "internal-tool"])
+        }
+        XCTAssertEqual(state.activities.count, 1); XCTAssertTrue(state.attention.isEmpty)
+        XCTAssertEqual(state.activities.first?.phase, .completed)
+        // Removing/acknowledging the parent cannot expose an internal orphan.
+        XCTAssertTrue(state.activities.filter { $0.threadID != parent }.isEmpty)
+        send("subagentStart", to: &state, thread: "internal-child", at: 10, extra: ["project": "fixture-project"])
+        let spawned = state.activities.first { $0.threadID == "internal-child" }
+        XCTAssertEqual(spawned?.phase, .running); XCTAssertEqual(spawned?.parentThreadID, parent)
+        XCTAssertEqual(spawned?.project, "fixture-project")
+    }
+    func testResultBeforeChildSourceDoesNotCreateOrphanAndLateUsageOnlyEnrichesEndedTurn() throws {
+        var state = ClaudeActivityState()
+        send("prompt", to: &state, at: 0)
+        send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+        send("agentResult", to: &state, at: 6, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+        XCTAssertEqual(state.activities.count, 1)
+        send("subagentStart", to: &state, thread: child, at: 2)
+        let end = try XCTUnwrap(state.activities.first { $0.threadID == child }?.phaseChangedAt)
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+        send("modelBlock", to: &state, thread: child, at: 5, extra: ["origin": "transcript", "requestId": "child-request", "messageId": "child-message", "outputTokens": 90, "toolIds": [String]()])
+        let measured = try XCTUnwrap(state.activities.first { $0.threadID == child })
+        XCTAssertEqual(measured.phaseChangedAt, end); XCTAssertEqual(measured.phase, .completed)
+        XCTAssertEqual(measured.responsePerformance?.tokensPerSecond, 30); XCTAssertNil(measured.firstTokenLatency)
+        send("subagentStart", to: &state, thread: child, at: 10, extra: ["promptId": "new-child-turn"])
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+        send("agentResult", to: &state, at: 11, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+    }
+    func testOrdinaryToolAndUnownedOrMalformedResultsCannotEndChild() {
+        var state = ClaudeActivityState()
+        send("prompt", to: &state, at: 0)
+        send("toolStart", to: &state, at: 1, extra: ["itemId": "ordinary-tool"])
+        send("subagentStart", to: &state, thread: child, at: 2)
+        send("agentResult", to: &state, at: 3, extra: ["itemId": "ordinary-tool", "agentId": child, "agentStatus": "completed"])
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+        send("toolStart", to: &state, at: 4, extra: ["itemId": "agent-tool", "agentTool": true])
+        send("agentResult", to: &state, at: 5, extra: ["promptId": NSNull(), "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+    }
+    private func notification(status: String = "completed", task: String? = nil, item: String = "agent-tool") -> String {
+        "<task-notification>\n<task-id>" + (task ?? child) + "</task-id>\n<tool-use-id>" + item + "</tool-use-id>\n<output-file>/PRIVATE/output</output-file>\n<status>" + status + "</status>\n<summary>PRIVATE &lt;summary&gt;</summary>\nPRIVATE escaped &lt;report&gt;\n</task-notification>"
+    }
+    private func notificationFixture(_ text: String, origin: Any = ["kind": "task-notification", "producer": "session-task", "runId": "engine-run"], at: String = "2027-01-15T08:00:10Z") -> [String: Any] {
+        ["type": "user", "sessionId": parent, "promptId": "engine-wake-prompt", "uuid": "engine-wake", "timestamp": at,
+         "origin": origin, "isMeta": false, "isSynthetic": false, "message": ["role": "user", "content": [["type": "text", "text": text]]]]
+    }
+    func testBackgroundOwnedNotificationEndsOnlyStoredChildTurnAfterParentNewPrompt() throws {
+        for status in ["completed", "failed", "killed"] {
+            for host in [String?.none, "remote-ssh-discovered:fixture"] {
+                var state = ClaudeActivityState(sourceID: host)
+                send("prompt", to: &state, at: 0)
+                send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+                send("subagentStart", to: &state, thread: child, at: 2, extra: ["promptId": "child-owned-turn"])
+                send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                send("stopVerified", to: &state, at: 4)
+                send("prompt", to: &state, at: 5, extra: ["promptId": "parent-new-turn"])
+                for rejected: [String: Any] in [["itemId": "other-tool"], ["agentId": "other-child"], ["sessionId": "other-parent"], ["at": now.timeIntervalSince1970 + 1]] {
+                    send("agentNotification", to: &state, at: 10, extra: ["origin": "transcript", "promptId": "engine-wake-prompt", "itemId": "agent-tool", "agentId": child, "agentStatus": status].merging(rejected) { _, new in new })
+                    XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+                }
+                send("agentNotification", to: &state, at: 10, extra: ["origin": "transcript", "promptId": "engine-wake-prompt", "itemId": "agent-tool", "agentId": child, "agentStatus": status])
+                let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(ended.phase, status == "completed" ? .completed : .interrupted)
+                XCTAssertEqual(ended.turnID, "child-owned-turn"); XCTAssertEqual(ended.turnFailed, status == "failed")
+                XCTAssertEqual(state.activities.first { $0.threadID == parent }?.turnID, "parent-new-turn")
+                XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .running)
+                send("subagentStart", to: &state, thread: child, at: 11, extra: ["promptId": "resumed-child-turn"])
+                send("agentNotification", to: &state, at: 12, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": status])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+            }
+        }
+    }
+    /// Claude Code 2.1.317 queues a background agent's notification as an
+    /// attachment when it arrives while the chat is mid-turn.
+    private func queuedNotificationFixture(_ text: String, type: String = "queued_command", mode: String = "task-notification",
+                                           origin: Any? = ["kind": "task-notification", "producer": "session-task"],
+                                           at: String = "2027-01-15T08:00:10Z") -> [String: Any] {
+        var attachment: [String: Any] = ["type": type, "prompt": text, "commandMode": mode, "source_uuid": "fixture-source",
+                                         "delivery_id": "fixture-delivery", "runId": "fixture-run", "timestamp": at,
+                                         "toolsUsedDelta": ["SubagentHandback"], "usage": ["totalTokens": 90, "toolUses": 3, "durationMs": 9000]]
+        if let origin { attachment["origin"] = origin }
+        return ["type": "attachment", "sessionId": parent, "uuid": "fixture-attachment", "parentUuid": "fixture-previous", "isSidechain": false,
+                "timestamp": at, "attachment": attachment, "rendered": [["content": "PRIVATE rendered reminder"]], "renderedRole": "system"]
+    }
+    func testQueuedAttachmentNotificationEndsTheBackgroundChildWhileTheParentWorks() throws {
+        let valid = notification()
+        let accepted = [queuedNotificationFixture(valid), queuedNotificationFixture(valid, origin: nil)]
+        let rejected = [queuedNotificationFixture(valid, mode: "prompt"), queuedNotificationFixture(valid, type: "file"),
+                        queuedNotificationFixture(valid, origin: ["kind": "human"]),
+                        queuedNotificationFixture(valid, origin: ["kind": "task-notification", "producer": "other"]),
+                        queuedNotificationFixture(valid, origin: "PRIVATE malformed"),
+                        queuedNotificationFixture(notification(status: "running")), queuedNotificationFixture("PRIVATE queued prompt")]
+        let fixtures = accepted + rejected
+        let native = try fixtures.flatMap { ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode($0)!, sessionID: parent, promptID: turn) }
+            .map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+        XCTAssertTrue(NSArray(array: try pythonRows(fixtures, owner: parent, parentID: nil)).isEqual(to: native), "Native and SSH parsers agree")
+        let notices = native.filter { $0["kind"] as? String == "agentNotification" }
+        XCTAssertEqual(notices.count, accepted.count)
+        XCTAssertTrue(notices.allSatisfy { $0["agentId"] as? String == child && $0["itemId"] as? String == "agent-tool" && $0["agentStatus"] as? String == "completed" })
+        for host in [String?.none, "remote-ssh-discovered:fixture"] {
+            var state = ClaudeActivityState(sourceID: host)
+            send("prompt", to: &state, at: 0)
+            send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+            send("subagentStart", to: &state, thread: child, at: 2)
+            send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+            send("toolStart", to: &state, at: 4, extra: ["itemId": "parent-work"])
+            // The ending only arrives as the queued attachment; the parent is still working.
+            for row in ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(queuedNotificationFixture(valid))!, sessionID: parent) {
+                state.consume(row, now: now.addingTimeInterval(100))
+            }
+            XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .running)
+            XCTAssertEqual(ActivityTaskGroup.make(state.activities).first?.runningSubagentCount, 0, "The parent row no longer counts the ended child")
+        }
+    }
+    func testBackgroundChildKeepsItsTurnAndRateAfterTheParentMovesOn() throws {
+        var state = ClaudeActivityState()
+        send("prompt", to: &state, at: 0)
+        send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+        send("subagentStart", to: &state, thread: child, at: 2)
+        send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+        send("stopVerified", to: &state, at: 4)
+        // Another agent's notification opens a new parent turn; the child's hooks now carry its prompt.
+        send("prompt", to: &state, at: 5, extra: ["promptId": "parent-next-turn"])
+        send("stopVerified", to: &state, at: 5.5, extra: ["promptId": "parent-next-turn"])
+        send("toolStart", to: &state, thread: child, at: 6, extra: ["promptId": "parent-next-turn", "itemId": "child-tool"])
+        send("toolEnd", to: &state, thread: child, at: 7, extra: ["promptId": "parent-next-turn", "itemId": "child-tool"])
+        let working = try XCTUnwrap(state.activities.first { $0.threadID == child })
+        XCTAssertEqual(working.turnID, turn, "The child keeps the turn its SubagentStart opened")
+        XCTAssertEqual(working.phase, .running); XCTAssertEqual(working.lastObserved, now.addingTimeInterval(7))
+        // Subagent request spans name the agent and carry no prompt.
+        func request(_ id: String, agent: String, start: Double, end: Double, tokens: Int) -> Data {
+            ClaudeActivityRecord.encode(["kind": "request", "sessionId": parent, "agentId": agent, "requestId": id, "startedAt": now.timeIntervalSince1970 + start,
+                "at": now.timeIntervalSince1970 + end, "outputTokens": tokens, "durationMs": (end - start) * 1000])!
+        }
+        state.consume(request("child-request", agent: child, start: 6, end: 9, tokens: 300), now: now.addingTimeInterval(10))
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.responsePerformance?.tokensPerSecond, 100)
+        XCTAssertNil(state.activities.first { $0.threadID == parent }?.responsePerformance, "A child's span never measures the parent")
+        let group = try XCTUnwrap(ActivityTaskGroup.make(state.activities).first)
+        XCTAssertEqual(group.runningSubagentCount, 1)
+        XCTAssertEqual(group.displayedRate(at: now.addingTimeInterval(10))?.value ?? 0, 100, accuracy: 0.01, "Only the working child sets the group's rate")
+        // An internal agent that never spawned a child cannot create one.
+        state.consume(request("internal-request", agent: "internal-agent", start: 6, end: 9, tokens: 300), now: now.addingTimeInterval(10))
+        XCTAssertNil(state.activities.first { $0.threadID == "internal-agent" })
+        // Once the child ends, a late record with the parent's newer prompt cannot reopen it.
+        send("agentNotification", to: &state, at: 11, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+        send("toolStart", to: &state, thread: child, at: 12, extra: ["promptId": "parent-next-turn", "itemId": "late-tool"])
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+    }
+    func testHooksDisabledParentBeforeChildBindsRealChildPromptAndHistoricalReplayStaysQuiet() throws {
+        for status in ["completed", "async_launched"] {
+            var state = ClaudeActivityState(), inbox = CompletionInbox(), policy = AttentionPolicy()
+            send("prompt", to: &state, at: 0, extra: ["origin": "transcript"], attaching: true)
+            send("toolStart", to: &state, at: 1, extra: ["origin": "transcript", "itemId": "agent-tool", "agentTool": true], attaching: true)
+            send("agentResult", to: &state, at: 6, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": status], attaching: true)
+            if status == "async_launched" {
+                send("agentNotification", to: &state, at: 8, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"], attaching: true)
+            }
+            XCTAssertEqual(state.activities.count, 1)
+            send("prompt", to: &state, thread: child, at: 2, extra: ["origin": "transcript", "promptId": "child-file-turn"], attaching: true)
+            let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+            XCTAssertEqual(ended.phase, .completed); XCTAssertEqual(ended.turnID, "child-file-turn")
+            XCTAssertTrue(ended.isHistoricalCompletion); XCTAssertNil(ended.responsePerformance)
+            inbox.observe(state.activities, at: now.addingTimeInterval(10), retention: 60)
+            XCTAssertTrue(inbox.unreadActivities.isEmpty); XCTAssertTrue(policy.activityNotices(state.activities, at: now.addingTimeInterval(10)).isEmpty)
+        }
+    }
+    func testStrictEngineHeaderRejectsHumanUnknownOriginNestedOrMalformedHeadersAndKeepsHumanPrompts() throws {
+        let valid = notification()
+        let invalidTexts = [valid.replacingOccurrences(of: "<task-id>" + child + "</task-id>", with: "<task-id>" + child + "</task-id>\n<task-id>" + child + "</task-id>"),
+                            valid.replacingOccurrences(of: "<task-id>" + child + "</task-id>", with: "<task-id><task-id>" + child + "</task-id></task-id>"),
+                            valid.replacingOccurrences(of: child, with: child + "\n"), notification(status: "running"),
+                            valid.replacingOccurrences(of: "<status>completed</status>", with: "<status>&completed;</status>"),
+                            "<!DOCTYPE example>" + valid, valid + "extra", valid.replacingOccurrences(of: "<task-id>", with: "<task-id attr='x'>")]
+        var fixtures = [notificationFixture(valid)] + invalidTexts.map { notificationFixture($0) }
+        var stringContent = notificationFixture(valid.replacingOccurrences(of: "PRIVATE escaped &lt;report&gt;", with: "<usage><total_tokens>90</total_tokens></usage>\n<status>failed</status>"))
+        stringContent["promptSource"] = "sdk"
+        stringContent["message"] = ["role": "user", "content": valid.replacingOccurrences(of: "PRIVATE escaped &lt;report&gt;", with: "<usage><total_tokens>90</total_tokens></usage>\n<status>failed</status>")]
+        fixtures.append(stringContent)
+        for origin: Any in [["kind": "human"], ["kind": "task-notification", "producer": "other"], ["kind": "task-notification", "producer": "session-task", "runId": "run\n"], ["kind": "other"], ["PRIVATE malformed"]] {
+            fixtures.append(notificationFixture(valid, origin: origin))
+        }
+        var secondText = notificationFixture(valid)
+        secondText["message"] = ["role": "user", "content": [["type": "text", "text": valid], ["type": "text", "text": "PRIVATE extra"]]]
+        fixtures.append(secondText)
+        let native = try fixtures.flatMap { ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode($0)!, sessionID: parent, promptID: turn) }.map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+        XCTAssertTrue(NSArray(array: try pythonRows(fixtures, owner: parent, parentID: nil)).isEqual(to: native))
+        XCTAssertEqual(native.filter { $0["kind"] as? String == "agentNotification" }.count, 2)
+        XCTAssertTrue(native.filter { $0["kind"] as? String == "agentNotification" }.allSatisfy { $0["agentStatus"] as? String == "completed" })
+        XCTAssertEqual(native.filter { $0["kind"] as? String == "prompt" }.count, 1) // genuine human literal remains a human turn
+        for source in ["hook", "transcript"] {
+            var state = ClaudeActivityState()
+            send("prompt", to: &state, at: 0, extra: ["origin": source])
+            for fixture in [notificationFixture(valid), notificationFixture(valid, origin: ["kind": "other"])] {
+                for row in ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(fixture)!, sessionID: parent, promptID: turn) { state.consume(row, now: now.addingTimeInterval(100)) }
+            }
+            XCTAssertEqual(state.activities.count, 1); XCTAssertEqual(state.activities.first?.turnID, turn)
+            let human = notificationFixture("PRIVATE genuine prompt", origin: ["kind": "human"])
+            let projectedHuman = ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(human)!, sessionID: parent, promptID: turn)
+            XCTAssertTrue(projectedHuman.contains { (try? JSONSerialization.jsonObject(with: $0) as? [String: Any])?["kind"] as? String == "prompt" })
+            for row in projectedHuman { state.consume(row, now: now.addingTimeInterval(100)) }
+            XCTAssertEqual(state.activities.first?.turnID, source == "hook" ? turn : "engine-wake-prompt")
+            if source == "hook" {
+                send("prompt", to: &state, at: 11, extra: ["promptId": "engine-wake-prompt"])
+                XCTAssertEqual(state.activities.first?.turnID, "engine-wake-prompt")
+            }
+        }
+    }
+    private func pythonRows(_ fixtures: [[String: Any]], owner: String, parentID: String?) throws -> [[String: Any]] {
+        let script = "__name__='fixture'\nimport base64,json,sys\nexec(base64.b64decode(sys.argv[1]).decode(),globals())\nrows=[]\nfor value in json.loads(base64.b64decode(sys.argv[2])):\n rows.extend(transcript(json.dumps(value).encode(),sys.argv[3],sys.argv[4] or None,sys.argv[5]))\nprint(json.dumps(rows,separators=(',',':')))\n"
+        let process = Process(), output = Pipe(), errors = Pipe()
+        process.executableURL = PythonFixture.executable
+        process.arguments = ["-c", script, Data(ClaudeActivityProbe.script.utf8).base64EncodedString(), try JSONSerialization.data(withJSONObject: fixtures).base64EncodedString(), owner, parentID ?? "", turn]
+        process.standardInput = FileHandle.nullDevice; process.standardOutput = output; process.standardError = errors
+        let pythonFixture = try PythonFixture.prepare(process); defer { pythonFixture.remove() }; try process.run(); let bytes = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0); XCTAssertTrue(errors.fileHandleForReading.readDataToEndOfFile().isEmpty)
+        XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("PRIVATE"))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [[String: Any]])
+    }
+    func testNativeSshTypedResultAndFileAliasProjectionAgreeWithoutPrivateOutputs() throws {
+        let result: [String: Any] = ["type": "user", "sessionId": parent, "promptId": turn, "timestamp": "2027-01-15T08:00:05Z", "message": ["content": [["type": "tool_result", "tool_use_id": "agent-tool", "content": "PRIVATE result"]]], "toolUseResult": ["status": "completed", "agentId": child, "content": "PRIVATE result", "prompt": "PRIVATE prompt"]]
+        let start: [String: Any] = ["type": "assistant", "sessionId": parent, "promptId": turn, "timestamp": "2027-01-15T08:00:01Z", "message": ["content": [["type": "tool_use", "id": "agent-tool", "name": "Agent", "input": ["prompt": "PRIVATE prompt"]]]]]
+        var fixtures = [start, result]
+        for response: Any in [["status": "async_launched", "agentId": child], ["status": "completed", "agentId": "child\n"], ["status": "PRIVATE status", "agentId": child], ["status": "completed", "agentId": 5], ["PRIVATE response"]] {
+            var fixture = result; fixture["toolUseResult"] = response; fixtures.append(fixture)
+        }
+        let native = try fixtures.flatMap { ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode($0)!, sessionID: parent, promptID: turn) }.map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+        let remote = try pythonRows(fixtures, owner: parent, parentID: nil)
+        XCTAssertTrue(NSArray(array: remote).isEqual(to: native))
+        XCTAssertEqual(native.filter { $0["kind"] as? String == "agentResult" }.count, 2)
+        XCTAssertEqual(native.first { $0["kind"] as? String == "toolStart" }?["agentTool"] as? Bool, true)
+        let aliases: [[String: Any]] = [child, "agent-" + child, "other-child", "agent-other-child"].map { header in
+            ["type": "user", "sessionId": parent, "agentId": header, "promptId": turn, "timestamp": "2027-01-15T08:00:02Z", "message": ["content": "PRIVATE prompt"]]
+        }
+        let projected = try aliases.flatMap { ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode($0)!, sessionID: child, parentID: parent, promptID: turn) }.map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+        XCTAssertTrue(NSArray(array: try pythonRows(aliases, owner: child, parentID: parent)).isEqual(to: projected))
+        XCTAssertEqual(projected.count, 4)
+        XCTAssertTrue(projected.allSatisfy { $0["sessionId"] as? String == child && $0["parentId"] as? String == parent })
+    }
+    func testForkedSkillResultEndsItsChildAndBackgroundForkWaitsForNotification() throws {
+        // Claude Code 2.1.309 runs `/code-review` as a forked Skill: its child
+        // ended, but no Agent result ever retired it.
+        let start: [String: Any] = ["type": "assistant", "sessionId": parent, "promptId": turn, "timestamp": "2027-01-15T08:00:01Z", "message": ["content": [["type": "tool_use", "id": "skill-tool", "name": "Skill", "input": ["skill": "PRIVATE skill", "args": "PRIVATE args"]]]]]
+        let forked: [String: Any] = ["success": true, "commandName": "PRIVATE skill", "status": "forked", "agentId": child, "result": "PRIVATE result"]
+        func result(_ response: Any) -> [String: Any] {
+            ["type": "user", "sessionId": parent, "promptId": turn, "timestamp": "2027-01-15T08:00:05Z", "message": ["content": [["type": "tool_result", "tool_use_id": "skill-tool", "content": "PRIVATE result"]]], "toolUseResult": response]
+        }
+        let background = forked.merging(["background": true, "result": "PRIVATE launch"]) { _, new in new }
+        let rejected: [Any] = [["success": true, "commandName": "PRIVATE skill", "status": "inline"], forked.merging(["success": false]) { _, new in new },
+                               forked.filter { $0.key != "success" }, forked.merging(["agentId": "child\n"]) { _, new in new }]
+        let fixtures = [start, result(forked), result(background)] + rejected.map(result)
+        let native = try fixtures.flatMap { ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode($0)!, sessionID: parent, promptID: turn) }.map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+        XCTAssertTrue(NSArray(array: try pythonRows(fixtures, owner: parent, parentID: nil)).isEqual(to: native))
+        XCTAssertEqual(native.first { $0["kind"] as? String == "toolStart" }?["agentTool"] as? Bool, true)
+        XCTAssertEqual(native.filter { $0["kind"] as? String == "agentResult" }.compactMap { $0["agentStatus"] as? String }, ["completed", "async_launched"])
+        for (response, launched) in [(forked, false), (background, true)] {
+            for host in [String?.none, "remote-ssh-discovered:fixture"] {
+                var state = ClaudeActivityState(sourceID: host)
+                send("prompt", to: &state, at: 0, extra: ["origin": "transcript"])
+                for row in ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(start)!, sessionID: parent, promptID: turn) { state.consume(row, now: now.addingTimeInterval(100)) }
+                send("subagentStart", to: &state, thread: child, at: 2, extra: ["promptId": "child-fork-turn"])
+                send("stopRequested", to: &state, thread: child, at: 4)
+                for row in ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(result(response))!, sessionID: parent, promptID: turn) { state.consume(row, now: now.addingTimeInterval(100)) }
+                send("stopVerified", to: &state, at: 6)
+                XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .completed)
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, launched ? .running : .completed)
+                guard launched else { continue }
+                send("agentNotification", to: &state, at: 10, extra: ["origin": "transcript", "promptId": "engine-wake-prompt", "itemId": "skill-tool", "agentId": child, "agentStatus": "completed"])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.turnID, "child-fork-turn")
+            }
+        }
+    }
+    /// Claude Code 2.1.317: SendMessage to a stopped background agent revives it.
+    /// The result names the agent without a status, and the revived run's
+    /// notification names the SendMessage call, not the first Agent call.
+    func testSendMessageRevivalIsABackgroundLaunchEndedOnlyByItsOwnNotification() throws {
+        let start: [String: Any] = ["type": "assistant", "sessionId": parent, "promptId": "revive-turn", "timestamp": "2027-01-15T08:00:11Z",
+            "message": ["content": [["type": "tool_use", "id": "send-tool", "name": "SendMessage", "input": ["to": child, "message": "PRIVATE follow-up"]]]]]
+        let revived: [String: Any] = ["success": true, "message": "PRIVATE resuming", "resumedAgentId": child, "revivedAgentId": child,
+                                      "pin": ["id": child, "name": "PRIVATE name", "ref": "PRIVATE"]]
+        func result(_ response: Any, at: String = "2027-01-15T08:00:13Z") -> [String: Any] {
+            ["type": "user", "sessionId": parent, "promptId": "revive-turn", "timestamp": at,
+             "message": ["content": [["type": "tool_result", "tool_use_id": "send-tool", "content": "PRIVATE result"]]], "toolUseResult": response]
+        }
+        // The owner of another agent's task gets only revivedAgentId.
+        let accepted: [Any] = [revived, ["success": true, "message": "PRIVATE resuming", "revivedAgentId": child], ["success": true, "resumedAgentId": child]]
+        // A message queued for a live agent, an inline report and failures name no new run.
+        let rejected: [Any] = [["success": true, "message": "PRIVATE queued"], revived.merging(["success": false]) { _, new in new },
+                               ["success": true, "message": "PRIVATE report", "inlineHandback": ["content": [["type": "text", "text": "PRIVATE report"]]]],
+                               revived.merging(["status": "PRIVATE status"]) { _, new in new }, ["success": true, "revivedAgentId": "child\n", "resumedAgentId": child],
+                               ["success": true, "revivedAgentId": 5], ["success": true, "revivedAgentId": parent], ["revivedAgentId": child]]
+        let fixtures = [start] + (accepted + rejected).map { result($0) }
+        let native = try fixtures.flatMap { ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode($0)!, sessionID: parent, promptID: turn) }
+            .map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+        XCTAssertTrue(NSArray(array: try pythonRows(fixtures, owner: parent, parentID: nil)).isEqual(to: native), "Native and SSH parsers agree")
+        XCTAssertEqual(native.first { $0["kind"] as? String == "toolStart" }?["agentTool"] as? Bool, true)
+        let launches = native.filter { $0["kind"] as? String == "agentResult" }
+        XCTAssertEqual(launches.count, accepted.count)
+        XCTAssertTrue(launches.allSatisfy { $0["agentId"] as? String == child && $0["itemId"] as? String == "send-tool" && $0["agentStatus"] as? String == "async_launched" })
+        // Hook clocks race: the child's SubagentStart can follow the PostToolUse
+        // launch by a fraction of a millisecond, and the transcript copy binds it.
+        for childFirst in [false, true] {
+            for host in [String?.none, "remote-ssh-discovered:fixture"] {
+                var state = ClaudeActivityState(sourceID: host)
+                func transcript(_ fixture: [String: Any]) {
+                    for row in ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(fixture)!, sessionID: parent, promptID: turn) { state.consume(row, now: now.addingTimeInterval(100)) }
+                }
+                send("prompt", to: &state, at: 0)
+                send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+                send("subagentStart", to: &state, thread: child, at: 2)
+                send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                send("stopVerified", to: &state, at: 4)
+                send("agentNotification", to: &state, at: 5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+                send("prompt", to: &state, at: 10, extra: ["promptId": "revive-turn"])
+                transcript(start)
+                send("toolStart", to: &state, at: 12.273, extra: ["promptId": "revive-turn", "itemId": "send-tool", "agentTool": true])
+                if childFirst { send("subagentStart", to: &state, thread: child, at: 12.43, extra: ["promptId": "revive-turn"]) }
+                send("toolEnd", to: &state, at: 12.438, extra: ["promptId": "revive-turn", "itemId": "send-tool"])
+                send("agentResult", to: &state, at: 12.438, extra: ["promptId": "revive-turn", "itemId": "send-tool", "agentId": child, "agentStatus": "async_launched"])
+                if !childFirst { send("subagentStart", to: &state, thread: child, at: 12.4385, extra: ["promptId": "revive-turn"]) }
+                transcript(result(revived))
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+                // SubagentStop alone is not an ending, and the parent's turn ends first.
+                send("stopRequested", to: &state, thread: child, at: 20, extra: ["promptId": "revive-turn"])
+                send("stopVerified", to: &state, at: 21, extra: ["promptId": "revive-turn"])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+                // The first run's notification cannot end the revived run.
+                send("agentNotification", to: &state, at: 22, extra: ["origin": "transcript", "promptId": "revive-turn", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+                XCTAssertEqual(ActivityTaskGroup.make(state.activities).first?.runningSubagentCount, 1)
+                send("agentNotification", to: &state, at: 23, extra: ["origin": "transcript", "promptId": "revive-turn", "itemId": "send-tool", "agentId": child, "agentStatus": "completed"])
+                let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(ended.phase, .completed); XCTAssertEqual(ended.turnID, "revive-turn")
+                let group = try XCTUnwrap(ActivityTaskGroup.make(state.activities).first)
+                XCTAssertEqual(group.runningSubagentCount, 0); XCTAssertFalse(group.isRunning, "The ended task no longer reads as running")
+            }
+        }
+    }
+    /// A background agent can finish while its chat is mid-turn, and the chat
+    /// can revive it before its prompt changes: every SubagentStart then
+    /// carries the prompt that already names the ended run.
+    func testRevivalInsideTheSameParentPromptRunsAgainAndEndsOnItsOwnNotification() throws {
+        for host in [String?.none, "remote-ssh-discovered:fixture"] {
+            var state = ClaudeActivityState(sourceID: host)
+            send("prompt", to: &state, at: 0)
+            send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+            send("subagentStart", to: &state, thread: child, at: 2)
+            send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+            send("agentNotification", to: &state, at: 5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+            XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed)
+            for (index, item) in ["send-tool", "send-again"].enumerated() {
+                let offset = Double(index) * 20
+                send("toolStart", to: &state, at: 11 + offset, extra: ["itemId": item, "agentTool": true])
+                send("subagentStart", to: &state, thread: child, at: 12 + offset)
+                send("toolStart", to: &state, thread: child, at: 12.5 + offset, extra: ["itemId": "child-tool-\(index)"])
+                send("agentResult", to: &state, at: 13 + offset, extra: ["itemId": item, "agentId": child, "agentStatus": "async_launched"])
+                let revived = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(revived.phase, .running); XCTAssertEqual(revived.turnStartedAt, now.addingTimeInterval(12 + offset))
+                XCTAssertNotEqual(revived.turnID, turn, "The revived run cannot reuse the retired turn")
+                XCTAssertEqual(revived.lastObserved, now.addingTimeInterval(12.5 + offset), "Records carrying the parent prompt follow the new run")
+                XCTAssertEqual(ActivityTaskGroup.make(state.activities).first?.runningSubagentCount, 1)
+                send("agentNotification", to: &state, at: 20 + offset, extra: ["origin": "transcript", "itemId": item, "agentId": child, "agentStatus": "completed"])
+                let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(ended.phase, .completed); XCTAssertEqual(ended.phaseChangedAt, now.addingTimeInterval(20 + offset))
+            }
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.turnID, turn)
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .running)
+        }
+    }
+    /// A hook reads its clock after its interpreter starts, so a background
+    /// child's SubagentStart can be stamped after both copies of its launch.
+    func testBackgroundChildStampedJustAfterItsLaunchStillBindsAndForegroundStaysStrict() throws {
+        for revival in [false, true] {
+            for (lag, binds) in [(0.0005, true), (4.0, true), (6.0, false)] {
+                for childFirst in [false, true] {
+                    var state = ClaudeActivityState()
+                    send("prompt", to: &state, at: 0)
+                    let item = revival ? "send-tool" : "agent-tool"
+                    if revival {
+                        send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+                        send("subagentStart", to: &state, thread: child, at: 2)
+                        send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                        send("agentNotification", to: &state, at: 5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                        send("prompt", to: &state, at: 10, extra: ["promptId": "revive-turn"])
+                    }
+                    let prompt = revival ? "revive-turn" : turn, launch = revival ? 12.438 : 2.0
+                    send("toolStart", to: &state, at: launch - 1, extra: ["promptId": prompt, "itemId": item, "agentTool": true])
+                    if childFirst { send("subagentStart", to: &state, thread: child, at: launch + lag, extra: ["promptId": prompt]) }
+                    send("agentResult", to: &state, at: launch, extra: ["promptId": prompt, "itemId": item, "agentId": child, "agentStatus": "async_launched"])
+                    send("agentResult", to: &state, at: launch, extra: ["origin": "transcript", "promptId": prompt, "itemId": item, "agentId": child, "agentStatus": "async_launched"])
+                    if !childFirst { send("subagentStart", to: &state, thread: child, at: launch + lag, extra: ["promptId": prompt]) }
+                    XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+                    send("agentNotification", to: &state, at: 30, extra: ["origin": "transcript", "itemId": item, "agentId": child, "agentStatus": "completed"])
+                    XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, binds ? .completed : .running,
+                                   "revival \(revival), SubagentStart \(lag) s after the launch, child first \(childFirst)")
+                }
+            }
+        }
+        // A foreground result reports a run that already ended: a run starting
+        // after it is a later one.
+        var state = ClaudeActivityState()
+        send("prompt", to: &state, at: 0)
+        send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+        send("agentResult", to: &state, at: 2, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+        send("subagentStart", to: &state, thread: child, at: 2.0005)
+        XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+    }
+    /// Hooks file every subagent under the root session, while Claude Code
+    /// reports an agent launched or revived by a subagent to that subagent, as
+    /// a queued attachment in its own file.
+    func testAgentLaunchedOrRevivedByAnotherSubagentEndsOnTheNotificationThatSubagentGets() throws {
+        let sender = "fixture-sender"
+        for revival in [false, true] {
+            let item = revival ? "send-tool" : "nested-tool"
+            let delivered = queuedNotificationFixture(notification(item: item), at: "2027-01-15T08:00:20Z")
+            let native = try ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(delivered)!, sessionID: sender, parentID: parent, promptID: turn)
+                .map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+            XCTAssertTrue(NSArray(array: try pythonRows([delivered], owner: sender, parentID: parent)).isEqual(to: native), "Native and SSH parsers agree")
+            let notices = native.filter { $0["kind"] as? String == "agentNotification" }
+            XCTAssertEqual(notices.count, 1)
+            XCTAssertEqual(notices.first?["sessionId"] as? String, sender); XCTAssertEqual(notices.first?["parentId"] as? String, parent)
+            for host in [String?.none, "remote-ssh-discovered:fixture"] {
+                var state = ClaudeActivityState(sourceID: host)
+                send("prompt", to: &state, at: 0)
+                if revival {
+                    send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+                    send("subagentStart", to: &state, thread: child, at: 2)
+                    send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                    send("agentNotification", to: &state, at: 5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                    send("prompt", to: &state, at: 9, extra: ["promptId": "next-turn"])
+                }
+                let prompt = revival ? "next-turn" : turn
+                send("subagentStart", to: &state, thread: sender, at: 10, extra: ["promptId": prompt])
+                send("toolStart", to: &state, thread: sender, at: 11, extra: ["promptId": prompt, "itemId": item, "agentTool": true])
+                send("subagentStart", to: &state, thread: child, at: 12, extra: ["promptId": prompt])
+                send("agentResult", to: &state, thread: sender, at: 13, extra: ["promptId": prompt, "itemId": item, "agentId": child, "agentStatus": "async_launched"])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+                // Another task's chat cannot end it.
+                send("agentNotification", to: &state, thread: "other-root", at: 15,
+                     extra: ["origin": "transcript", "parentId": NSNull(), "itemId": item, "agentId": child, "agentStatus": "completed"])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running)
+                for row in ClaudeActivityRecord.transcript(ClaudeActivityRecord.encode(delivered)!, sessionID: sender, parentID: parent, promptID: prompt) {
+                    state.consume(row, now: now.addingTimeInterval(100))
+                }
+                let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(ended.phase, .completed, "revival \(revival)"); XCTAssertEqual(ended.phaseChangedAt, now.addingTimeInterval(20))
+                XCTAssertEqual(ended.parentThreadID, parent, "The ended child stays filed under the root session")
+                XCTAssertEqual(state.activities.first { $0.threadID == sender }?.phase, .running)
+            }
+        }
+    }
+    /// A cold replay drains the hook spool before the transcript, so a revival's
+    /// SubagentStart arrives while the first run's ending is still unread.
+    func testColdReplayEndsARevivedChildWhoseFirstEndingIsReadAfterItsRevival() throws {
+        let program = """
+        __name__ = 'fixture'
+        import base64, json, pathlib, sys
+        exec(base64.b64decode(sys.argv[1]), globals())
+        transcript, spool = map(pathlib.Path, sys.argv[2:4])
+        reader = Tailer.__new__(Tailer)
+        reader.dirty = {transcript, spool}
+        reader.cursors = {path: {'inode': 0, 'offset': 0, 'fragment': b'', 'session': sys.argv[4], 'parent': None, 'owned': owned, 'historicalEnd': None}
+                          for path, owned in ((transcript, False), (spool, True))}
+        records = reader.read()
+        assert not reader.dirty
+        print(json.dumps(records))
+        """
+        for samePrompt in [true, false] {
+            let home = FileManager.default.temporaryDirectory.appendingPathComponent("pacer-revival-replay-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: home) }
+            let project = home.appendingPathComponent("projects/fixture"), pacer = home.appendingPathComponent("pacer")
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: pacer, withIntermediateDirectories: true)
+            let transcript = project.appendingPathComponent(parent + ".jsonl"), spool = pacer.appendingPathComponent("events.jsonl")
+            let revival = samePrompt ? turn : "next-turn"
+            func raw(_ type: String, _ id: String, _ second: Int, _ prompt: String, _ previous: String?, _ extra: [String: Any]) -> [String: Any] {
+                var record: [String: Any] = ["type": type, "uuid": id, "sessionId": parent, "promptId": prompt, "timestamp": String(format: "2027-01-15T08:00:%02dZ", second)]
+                if let previous { record["parentUuid"] = previous }
+                return record.merging(extra) { _, new in new }
+            }
+            func delivered(_ item: String) -> [String: Any] {
+                ["attachment": ["type": "queued_command", "commandMode": "task-notification", "origin": ["kind": "task-notification", "producer": "session-task"],
+                                "prompt": notification(item: item)]]
+            }
+            func call(_ name: String, _ item: String) -> [String: Any] { ["message": ["content": [["type": "tool_use", "id": item, "name": name]]]] }
+            func result(_ item: String, _ response: [String: Any]) -> [String: Any] {
+                ["message": ["content": [["type": "tool_result", "tool_use_id": item, "content": "PRIVATE result"]]], "toolUseResult": response]
+            }
+            var records = [raw("user", "human", 0, turn, nil, ["origin": ["kind": "human"], "message": ["role": "user", "content": "PRIVATE prompt"]]),
+                           raw("assistant", "agent-call", 1, turn, "human", call("Agent", "agent-tool")),
+                           raw("user", "agent-result", 3, turn, "agent-call", result("agent-tool", ["status": "async_launched", "agentId": child])),
+                           raw("attachment", "first-ending", 5, turn, "agent-result", delivered("agent-tool"))]
+            if !samePrompt { records.append(raw("user", "next-human", 10, revival, "first-ending", ["origin": ["kind": "human"], "message": ["role": "user", "content": "PRIVATE next"]])) }
+            records += [raw("assistant", "send-call", 11, revival, samePrompt ? "first-ending" : "next-human", call("SendMessage", "send-tool")),
+                        raw("user", "send-result", 13, revival, "send-call", result("send-tool", ["success": true, "revivedAgentId": child, "resumedAgentId": child])),
+                        raw("attachment", "revived-ending", 20, revival, "send-result", delivered("send-tool")),
+                        raw("system", "stop", 22, revival, "revived-ending", ["subtype": "stop_hook_summary", "preventedContinuation": false,
+                            "hookErrors": [String](), "hookAdditionalContext": [String]()])]
+            func hook(_ kind: String, _ second: Double, _ prompt: String, _ extra: [String: Any] = [:]) -> [String: Any] {
+                ["kind": kind, "origin": "hook", "sessionId": parent, "promptId": prompt, "at": now.timeIntervalSince1970 + second].merging(extra) { _, new in new }
+            }
+            let childRow: [String: Any] = ["sessionId": child, "parentId": parent]
+            var hooks = [hook("prompt", 0.01, turn), hook("toolStart", 1.01, turn, ["itemId": "agent-tool", "agentTool": true]), hook("subagentStart", 2, turn, childRow),
+                         hook("agentResult", 3.01, turn, ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"]), hook("stopRequested", 4.99, turn, childRow)]
+            if !samePrompt { hooks.append(hook("prompt", 10.01, revival)) }
+            hooks += [hook("toolStart", 11.01, revival, ["itemId": "send-tool", "agentTool": true]), hook("subagentStart", 12, revival, childRow),
+                      hook("agentResult", 13.01, revival, ["itemId": "send-tool", "agentId": child, "agentStatus": "async_launched"]),
+                      hook("stopRequested", 19.99, revival, childRow), hook("stopRequested", 21.99, revival)]
+            func lines(_ rows: [[String: Any]]) throws -> Data { try rows.reduce(into: Data()) { data, row in data += try JSONSerialization.data(withJSONObject: row); data.append(10) } }
+            try lines(records).write(to: transcript); try lines(hooks).write(to: spool)
+            var reader = ClaudeActivityReader()
+            let local = reader.read(home: home, discover: true, now: now.addingTimeInterval(25))
+            XCTAssertTrue(local.caughtUp)
+            let process = Process(), output = Pipe(), errors = Pipe()
+            process.executableURL = PythonFixture.executable
+            process.arguments = ["-c", program, Data(ClaudeActivityProbe.script.utf8).base64EncodedString(), transcript.path, spool.path, parent]
+            process.standardInput = FileHandle.nullDevice; process.standardOutput = output; process.standardError = errors
+            let pythonFixture = try PythonFixture.prepare(process); defer { pythonFixture.remove() }; try process.run()
+            let bytes = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+            XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("PRIVATE"))
+            let remote = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [[String: Any]])
+            for (name, host, frames) in [("local", String?.none, local.records), ("ssh", "remote-ssh-discovered:fixture", [ClaudeActivityRecord.encode(["kind": "claudeBatch", "records": remote])!])] {
+                let label = "\(name), same parent prompt \(samePrompt)"
+                var state = ClaudeActivityState(sourceID: host)
+                for frame in frames { state.consume(frame, now: now.addingTimeInterval(25)) }
+                state.finalizeHistoricalBaseline(now: now.addingTimeInterval(25))
+                XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .completed, label)
+                let ended = try XCTUnwrap(state.activities.first { $0.threadID == child }, label)
+                XCTAssertEqual(ended.turnStartedAt, now.addingTimeInterval(12), label)
+                XCTAssertEqual(ended.phase, .completed, label)
+                XCTAssertEqual(ActivityTaskGroup.make(state.activities).first?.runningSubagentCount, 0, label)
+            }
+        }
+    }
+    /// SubagentStart fires once per run: a copy carrying the same time keeps
+    /// that run, including a revived run's own turn and its measured output.
+    func testRepeatedSubagentStartOfTheSameRunKeepsThatRunAndItsOutput() throws {
+        for revival in [false, true] {
+            var state = ClaudeActivityState()
+            send("prompt", to: &state, at: 0)
+            send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+            send("subagentStart", to: &state, thread: child, at: 2)
+            send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+            var item = "agent-tool", start = 2.0
+            if revival {
+                send("agentNotification", to: &state, at: 5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                send("toolStart", to: &state, at: 11, extra: ["itemId": "send-tool", "agentTool": true])
+                send("subagentStart", to: &state, thread: child, at: 12)
+                send("agentResult", to: &state, at: 13, extra: ["itemId": "send-tool", "agentId": child, "agentStatus": "async_launched"])
+                item = "send-tool"; start = 12
+            }
+            let run = try XCTUnwrap(state.activities.first { $0.threadID == child })
+            send("subagentStart", to: &state, thread: child, at: start)
+            let value = try XCTUnwrap(state.activities.first { $0.threadID == child })
+            XCTAssertEqual(value.turnID, run.turnID); XCTAssertEqual(value.turnStartedAt, now.addingTimeInterval(start))
+            XCTAssertEqual(value.phase, .running)
+            send("modelBlock", to: &state, thread: child, at: start + 3,
+                 extra: ["origin": "transcript", "requestId": "child-request", "messageId": "child-message", "outputTokens": 90, "toolIds": [String]()])
+            send("agentNotification", to: &state, at: start + 8, extra: ["origin": "transcript", "itemId": item, "agentId": child, "agentStatus": "completed"])
+            let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+            XCTAssertEqual(ended.phase, .completed, "revival \(revival)")
+            XCTAssertEqual(ended.responsePerformance?.responseID, "child-request", "The copy keeps the run's measured output, revival \(revival)")
+        }
+    }
+    /// The monitor keeps a host's state across an SSH reconnect, and the new
+    /// helper replays the spool from its start as a baseline.
+    func testSshReconnectResumesTheChildRunItsLaunchIsBoundTo() throws {
+        for revival in [false, true] {
+            for activity in [false, true] {
+                let label = "revival \(revival), child activity after its start \(activity)"
+                var state = ClaudeActivityState(sourceID: "remote-ssh-discovered:fixture")
+                var spool: [[String: Any]] = []
+                func record(_ kind: String, thread: String? = nil, at offset: Double, _ extra: [String: Any] = [:]) {
+                    var row: [String: Any] = ["kind": kind, "origin": "hook", "sessionId": thread ?? parent, "promptId": turn, "at": now.timeIntervalSince1970 + offset]
+                    if let thread, thread != parent { row["parentId"] = parent }
+                    row.merge(extra) { _, new in new }
+                    spool.append(row); state.consume(ClaudeActivityRecord.encode(row)!, now: now.addingTimeInterval(100))
+                }
+                record("prompt", at: 0)
+                record("toolStart", at: 1, ["itemId": "agent-tool", "agentTool": true])
+                record("subagentStart", thread: child, at: 2)
+                record("agentResult", at: 3, ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                var item = "agent-tool", start = 2.0
+                if revival {
+                    record("agentNotification", at: 5, ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                    record("toolStart", at: 11, ["itemId": "send-tool", "agentTool": true])
+                    record("subagentStart", thread: child, at: 12)
+                    record("agentResult", at: 13, ["itemId": "send-tool", "agentId": child, "agentStatus": "async_launched"])
+                    item = "send-tool"; start = 12
+                }
+                // Activity long after the launch moves the child's last evidence
+                // past its SubagentStart, so the replayed start is too old to apply.
+                if activity { record("toolStart", thread: child, at: start + 30, ["itemId": "child-tool"]) }
+                let before = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(before.phase, .running, label)
+                state.unavailable()
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .unknown, label)
+                state.consume(ClaudeActivityRecord.encode(["kind": "status", "connected": true, "claudeHome": true])!)
+                state.consume(ClaudeActivityRecord.encode(["kind": "claudeBatch", "attaching": true, "records": spool])!, now: now.addingTimeInterval(100))
+                let resumed = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(resumed.phase, .running, label); XCTAssertEqual(resumed.turnID, before.turnID, label)
+                send("agentNotification", to: &state, at: start + 40, extra: ["origin": "transcript", "itemId": item, "agentId": child, "agentStatus": "completed"])
+                let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(ended.phase, .completed, label); XCTAssertEqual(ended.phaseChangedAt, now.addingTimeInterval(start + 40), label)
+            }
+        }
+    }
+    /// A run that ends within seconds can be revived inside the skew allowance
+    /// of its own launch. A copy of that launch read after the revival (a cold
+    /// replay reads transcripts after the hooks) cannot claim the revived run,
+    /// so the first run's late notification leaves the revived run working.
+    /// At 8.125 s the revival falls outside the hook copy's allowance (3 + 5 s)
+    /// but inside the transcript copy's (3.25 + 5 s).
+    func testLaunchCopyReadAfterAQuickRevivalCannotClaimTheRevivedRun() throws {
+        for revival in [6.0, 7.875, 8.125] {
+            for host in [String?.none, "remote-ssh-discovered:fixture"] {
+                let label = "revival at \(revival) s, host \(host ?? "local")"
+                var state = ClaudeActivityState(sourceID: host)
+                send("prompt", to: &state, at: 0)
+                send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+                send("subagentStart", to: &state, thread: child, at: 2)
+                send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                send("toolStart", to: &state, at: revival - 0.5, extra: ["itemId": "send-tool", "agentTool": true])
+                send("subagentStart", to: &state, thread: child, at: revival)
+                let revived = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(revived.phase, .running, label); XCTAssertNotEqual(revived.turnID, turn, label)
+                send("agentResult", to: &state, at: 3.25, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                send("agentNotification", to: &state, at: revival + 0.5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running, "The first run's notification cannot end the revived run, " + label)
+                send("agentResult", to: &state, at: revival + 1, extra: ["origin": "transcript", "itemId": "send-tool", "agentId": child, "agentStatus": "async_launched"])
+                send("agentNotification", to: &state, at: 20, extra: ["origin": "transcript", "itemId": "send-tool", "agentId": child, "agentStatus": "completed"])
+                let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                XCTAssertEqual(ended.turnID, revived.turnID, label); XCTAssertEqual(ended.phase, .completed, label)
+                XCTAssertEqual(ended.phaseChangedAt, now.addingTimeInterval(20), label)
+            }
+        }
+    }
+    /// Sweeps the orders in which a quick revival's records can arrive around
+    /// the skew allowance: whether the first run already ended, when the first
+    /// launch's transcript copy is stamped and read, and whether the revival's
+    /// hook copy is missing (an older installed hook) or comes before or after
+    /// its SubagentStart. The first launch never ends the revived run, and the
+    /// revival's own notification always does.
+    func testQuickRevivalOrderingsNeverLetTheFirstLaunchEndTheRevivedRun() throws {
+        for revival in [4.0, 6.0, 7.875, 8.125, 9.0, 12.0] {
+            for copyAt in [3.0, 3.25, 3.875] {
+                for copyAfterRevival in [false, true] {
+                    for sendHook in ["none", "beforeStart", "afterStart"] {
+                        for firstEnded in [false, true] {
+                            let label = "revival \(revival), copy \(copyAt) read after revival \(copyAfterRevival), send hook \(sendHook), first ended \(firstEnded)"
+                            var state = ClaudeActivityState()
+                            send("prompt", to: &state, at: 0)
+                            send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+                            send("subagentStart", to: &state, thread: child, at: 2)
+                            send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+                            func firstCopy() { send("agentResult", to: &state, at: copyAt, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"]) }
+                            func sendLaunch(at offset: Double, origin: String = "hook") {
+                                send("agentResult", to: &state, at: offset, extra: ["origin": origin, "itemId": "send-tool", "agentId": child, "agentStatus": "async_launched"])
+                            }
+                            if firstEnded { send("agentNotification", to: &state, at: 3.5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"]) }
+                            if !copyAfterRevival { firstCopy() }
+                            send("toolStart", to: &state, at: revival - 0.5, extra: ["itemId": "send-tool", "agentTool": true])
+                            if sendHook == "beforeStart" { sendLaunch(at: revival) }
+                            send("subagentStart", to: &state, thread: child, at: revival)
+                            if sendHook == "afterStart" { sendLaunch(at: revival) }
+                            let revived = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                            XCTAssertEqual(revived.phase, .running, label); XCTAssertEqual(revived.turnStartedAt, now.addingTimeInterval(revival), label)
+                            if copyAfterRevival { firstCopy() }
+                            if !firstEnded {
+                                send("agentNotification", to: &state, at: revival + 0.5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+                            }
+                            XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running, label)
+                            sendLaunch(at: revival + 1, origin: "transcript")
+                            send("agentNotification", to: &state, at: 30, extra: ["origin": "transcript", "itemId": "send-tool", "agentId": child, "agentStatus": "completed"])
+                            let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+                            XCTAssertEqual(ended.turnID, revived.turnID, label); XCTAssertEqual(ended.phase, .completed, label)
+                            XCTAssertEqual(ended.phaseChangedAt, now.addingTimeInterval(30), label)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// Claude Code can keep a revived agent's ending in another file than the
+    /// SendMessage result. Without a hook copy of the launch, the ending can
+    /// be read first; it waits for its launch instead of being dropped.
+    func testEndingReadBeforeItsLaunchWaitsForThatLaunch() throws {
+        let sender = "fixture-sender"
+        for host in [String?.none, "remote-ssh-discovered:fixture"] {
+            var state = ClaudeActivityState(sourceID: host)
+            send("prompt", to: &state, at: 0)
+            send("toolStart", to: &state, at: 1, extra: ["itemId": "agent-tool", "agentTool": true])
+            send("subagentStart", to: &state, thread: child, at: 2)
+            send("agentResult", to: &state, at: 3, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"])
+            send("subagentStart", to: &state, thread: sender, at: 4)
+            send("agentNotification", to: &state, at: 5, extra: ["origin": "transcript", "itemId": "agent-tool", "agentId": child, "agentStatus": "completed"])
+            send("toolStart", to: &state, thread: sender, at: 11, extra: ["origin": "transcript", "itemId": "send-tool", "agentTool": true])
+            send("subagentStart", to: &state, thread: child, at: 12)
+            send("agentNotification", to: &state, at: 20, extra: ["origin": "transcript", "itemId": "send-tool", "agentId": child, "agentStatus": "completed"])
+            XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .running, "The ending waits for its launch")
+            send("agentResult", to: &state, thread: sender, at: 13, extra: ["origin": "transcript", "itemId": "send-tool", "agentId": child, "agentStatus": "async_launched"])
+            let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+            XCTAssertEqual(ended.phase, .completed); XCTAssertEqual(ended.phaseChangedAt, now.addingTimeInterval(20))
+            XCTAssertEqual(ended.turnStartedAt, now.addingTimeInterval(12))
+        }
+    }
+    /// The native reader reads the root transcript before a subagent's file.
+    /// With an older hook that records no SendMessage launch, a revival's
+    /// ending kept in the root is read before the sender's SendMessage result.
+    func testColdReplayEndsARevivalWhoseEndingIsReadBeforeTheSendersResult() throws {
+        let sender = "fixture-sender"
+        for noticeInRoot in [false, true] {
+            let home = FileManager.default.temporaryDirectory.appendingPathComponent("pacer-revival-files-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: home) }
+            let project = home.appendingPathComponent("projects/fixture"), subagents = project.appendingPathComponent(parent + "/subagents")
+            let pacer = home.appendingPathComponent("pacer")
+            for directory in [subagents, pacer] { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+            func raw(_ type: String, _ id: String, _ second: Int, _ previous: String?, _ extra: [String: Any]) -> [String: Any] {
+                var record: [String: Any] = ["type": type, "uuid": id, "sessionId": parent, "promptId": turn, "timestamp": String(format: "2027-01-15T08:00:%02dZ", second)]
+                if let previous { record["parentUuid"] = previous }
+                return record.merging(extra) { _, new in new }
+            }
+            func delivered(_ item: String) -> [String: Any] {
+                ["attachment": ["type": "queued_command", "commandMode": "task-notification", "origin": ["kind": "task-notification", "producer": "session-task"],
+                                "prompt": notification(item: item)]]
+            }
+            func lines(_ rows: [[String: Any]]) throws -> Data { try rows.reduce(into: Data()) { data, row in data += try JSONSerialization.data(withJSONObject: row); data.append(10) } }
+            var root = [raw("user", "human", 0, nil, ["origin": ["kind": "human"], "message": ["role": "user", "content": "PRIVATE prompt"]]),
+                        raw("assistant", "agent-call", 1, "human", ["message": ["content": [["type": "tool_use", "id": "agent-tool", "name": "Agent"]]]]),
+                        raw("user", "agent-result", 3, "agent-call", ["message": ["content": [["type": "tool_result", "tool_use_id": "agent-tool", "content": "PRIVATE"]]],
+                            "toolUseResult": ["status": "async_launched", "agentId": child]]),
+                        raw("attachment", "first-ending", 5, "agent-result", delivered("agent-tool"))]
+            var senderFile = [raw("assistant", "send-call", 11, "first-ending", ["agentId": sender, "message": ["content": [["type": "tool_use", "id": "send-tool", "name": "SendMessage"]]]]),
+                              raw("user", "send-result", 13, "send-call", ["agentId": sender, "message": ["content": [["type": "tool_result", "tool_use_id": "send-tool", "content": "PRIVATE"]]],
+                                  "toolUseResult": ["success": true, "revivedAgentId": child]])]
+            let ending = raw("attachment", "revived-ending", 20, "send-result", delivered("send-tool"))
+            if noticeInRoot { root.append(ending) } else { senderFile.append(ending.merging(["agentId": sender]) { _, new in new }) }
+            root.append(raw("system", "stop", 22, "revived-ending", ["subtype": "stop_hook_summary", "preventedContinuation": false,
+                "hookErrors": [String](), "hookAdditionalContext": [String]()]))
+            func hook(_ kind: String, _ second: Double, _ extra: [String: Any] = [:]) -> [String: Any] {
+                ["kind": kind, "origin": "hook", "sessionId": parent, "promptId": turn, "at": now.timeIntervalSince1970 + second].merging(extra) { _, new in new }
+            }
+            // An older hook adds no agent-tool flag or launch for SendMessage.
+            let spool = [hook("prompt", 0.01), hook("toolStart", 1.01, ["itemId": "agent-tool", "agentTool": true]),
+                         hook("subagentStart", 2, ["sessionId": child, "parentId": parent]),
+                         hook("agentResult", 3.01, ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"]),
+                         hook("subagentStart", 4, ["sessionId": sender, "parentId": parent]), hook("stopRequested", 4.99, ["sessionId": child, "parentId": parent]),
+                         hook("toolStart", 11.01, ["sessionId": sender, "parentId": parent, "itemId": "send-tool"]),
+                         hook("subagentStart", 12, ["sessionId": child, "parentId": parent]), hook("stopRequested", 19.99, ["sessionId": child, "parentId": parent]),
+                         hook("stopRequested", 21.99)]
+            try lines(root).write(to: project.appendingPathComponent(parent + ".jsonl"))
+            try lines(senderFile).write(to: subagents.appendingPathComponent("agent-" + sender + ".jsonl"))
+            try lines(spool).write(to: pacer.appendingPathComponent("events.jsonl"))
+            var reader = ClaudeActivityReader()
+            let read = reader.read(home: home, discover: true, now: now.addingTimeInterval(25))
+            XCTAssertTrue(read.caughtUp)
+            var state = ClaudeActivityState()
+            for frame in read.records { state.consume(frame, now: now.addingTimeInterval(25)) }
+            state.finalizeHistoricalBaseline(now: now.addingTimeInterval(25))
+            let ended = try XCTUnwrap(state.activities.first { $0.threadID == child })
+            XCTAssertEqual(ended.turnStartedAt, now.addingTimeInterval(12), "ending in the root \(noticeInRoot)")
+            XCTAssertEqual(ended.phase, .completed, "ending in the root \(noticeInRoot)")
+            XCTAssertEqual(ended.phaseChangedAt, now.addingTimeInterval(20), "ending in the root \(noticeInRoot)")
+        }
+    }
+    func testSshColdReplayEstablishesHookEngineTurnBeforeExactStopAndNextHumanAppend() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("pacer-child-cold-replay-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let root = home.appendingPathComponent("root.jsonl"), spool = home.appendingPathComponent("hooks.jsonl")
+        func raw(_ type: String, id: String, parentID: String? = nil, second: Int, extra: [String: Any] = [:]) -> [String: Any] {
+            var row: [String: Any] = ["type": type, "uuid": id, "sessionId": parent, "timestamp": String(format: "2027-01-15T08:00:%02dZ", second)]
+            if let parentID { row["parentUuid"] = parentID }
+            return row.merging(extra) { _, new in new }
+        }
+        func hook(_ kind: String, second: Double, prompt: String, extra: [String: Any] = [:]) -> [String: Any] {
+            ["kind": kind, "origin": "hook", "sessionId": parent, "promptId": prompt, "at": now.timeIntervalSince1970 + second].merging(extra) { _, new in new }
+        }
+        let transcript: [[String: Any]] = [
+            raw("user", id: "human-1", second: 0, extra: ["promptId": turn, "origin": ["kind": "human"], "message": ["role": "user", "content": "PRIVATE prompt"]]),
+            raw("assistant", id: "tool-1", parentID: "human-1", second: 1, extra: ["message": ["content": [["type": "tool_use", "id": "agent-tool", "name": "Agent", "input": ["prompt": "PRIVATE child prompt"]]]]]),
+            raw("user", id: "result-1", parentID: "tool-1", second: 3, extra: ["message": ["content": [["type": "tool_result", "tool_use_id": "agent-tool", "content": "PRIVATE result"]]], "toolUseResult": ["status": "async_launched", "agentId": child]]),
+            raw("assistant", id: "answer-1", parentID: "result-1", second: 4, extra: ["message": ["content": [["type": "text", "text": "PRIVATE response"]]]]),
+            raw("system", id: "stop-1", parentID: "answer-1", second: 5, extra: ["subtype": "stop_hook_summary", "preventedContinuation": false, "hookErrors": [String](), "hookAdditionalContext": [String]()]),
+            raw("user", id: "engine-1", parentID: "stop-1", second: 8, extra: ["promptId": "engine-turn", "origin": ["kind": "automation"], "isMeta": true, "message": ["content": "PRIVATE engine input"]]),
+            raw("assistant", id: "engine-answer", parentID: "engine-1", second: 10, extra: ["message": ["content": [["type": "text", "text": "PRIVATE engine response"]]]]),
+            raw("system", id: "engine-stop", parentID: "engine-answer", second: 12, extra: ["subtype": "stop_hook_summary", "preventedContinuation": false, "hookErrors": [String](), "hookAdditionalContext": [String]()]),
+            notificationFixture(notification(), at: "2027-01-15T08:00:13Z")]
+        let hooks: [[String: Any]] = [hook("prompt", second: 0.04, prompt: turn), hook("toolStart", second: 1.04, prompt: turn, extra: ["itemId": "agent-tool", "agentTool": true]),
+            hook("subagentStart", second: 2, prompt: "child-owned-turn", extra: ["sessionId": child, "parentId": parent]),
+            hook("agentResult", second: 3.04, prompt: turn, extra: ["itemId": "agent-tool", "agentId": child, "agentStatus": "async_launched"]),
+            hook("stopRequested", second: 4.99, prompt: turn), hook("prompt", second: 8.04, prompt: "engine-turn"), hook("stopRequested", second: 11.99, prompt: "engine-turn")]
+        func lines(_ values: [[String: Any]]) throws -> Data { try values.reduce(into: Data()) { data, row in data += try JSONSerialization.data(withJSONObject: row); data.append(10) } }
+        let nextRaw = raw("user", id: "next-human", parentID: "engine-stop", second: 20, extra: ["promptId": "next-human-turn", "origin": ["kind": "human"], "message": ["content": "PRIVATE next prompt"]])
+        let program = """
+        __name__='fixture'
+        import base64,json,pathlib,sys
+        exec(base64.b64decode(sys.argv[1]).decode(),globals())
+        class OrderedDirty:
+         def __init__(self,paths):self.paths=list(paths)
+         def __iter__(self):return iter(self.paths)
+         def discard(self,path):self.paths=[p for p in self.paths if p!=path]
+         def add(self,path):
+          if path not in self.paths:self.paths.append(path)
+        root=pathlib.Path(sys.argv[2]);spool=pathlib.Path(sys.argv[3]);owner=sys.argv[4]
+        order=[root,spool] if sys.argv[5]=='root-first' else [spool,root]
+        tailer=Tailer.__new__(Tailer);tailer.cursors={};tailer.dirty=OrderedDirty(order)
+        for path,owned in ((root,False),(spool,True)):
+         tailer.cursors[path]={'inode':0,'offset':0,'fragment':b'','session':owner,'parent':None,'owned':owned,'historicalEnd':None}
+        def drain():
+         batches=[];deferred=0
+         for _ in range(8):
+          if not list(tailer.dirty):break
+          before=tailer.cursors[root]['offset'];rows=tailer.read();batches.append(rows)
+          assert sum(row.get('origin')=='hook' for row in rows)<=512
+          cursor=tailer.cursors[spool]
+          if cursor['offset']<spool.stat().st_size or b'\\n' in cursor['fragment']:
+           assert tailer.cursors[root]['offset']==before;deferred+=1
+         assert not list(tailer.dirty)
+         return batches,deferred
+        cold,cold_deferred=drain()
+        for path,argument in ((root,sys.argv[6]),(spool,sys.argv[7])):
+         with path.open('ab') as handle:handle.write(base64.b64decode(argument))
+        tailer.dirty=OrderedDirty(order);appended,append_deferred=drain()
+        with spool.open('ab') as handle:handle.write(b'{"unfinished":')
+        with root.open('ab') as handle:handle.write(base64.b64decode(sys.argv[8]))
+        tailer.dirty=OrderedDirty(order);partial=tailer.read()
+        print(json.dumps({'cold':cold,'appended':appended,'coldDeferred':cold_deferred,'appendDeferred':append_deferred,
+         'partialReadRoot':tailer.cursors[root]['offset']==root.stat().st_size,'partialLeftDirty':bool(list(tailer.dirty))},separators=(',',':')))
+        """
+        for backlog in [0, 520] { for order in ["root-first", "hooks-first"] {
+            let filler = Array(repeating: hook("metadata", second: 7, prompt: turn), count: backlog)
+            let coldHooks = Array(hooks.prefix(5)) + filler + Array(hooks.suffix(2))
+            try lines(transcript).write(to: root); try lines(coldHooks).write(to: spool)
+            let process = Process(), output = Pipe(), errors = Pipe()
+            process.executableURL = PythonFixture.executable
+            process.arguments = ["-c", program, Data(ClaudeActivityProbe.script.utf8).base64EncodedString(), root.path, spool.path, parent, order,
+                try lines([nextRaw]).base64EncodedString(), try lines(filler + [hook("prompt", second: 20.04, prompt: "next-human-turn")]).base64EncodedString(),
+                try lines([raw("assistant", id: "metadata-1", second: 21, extra: ["message": ["model": "fixture-model", "content": [Any]()]])]).base64EncodedString()]
+            process.standardInput = FileHandle.nullDevice; process.standardOutput = output; process.standardError = errors
+            let pythonFixture = try PythonFixture.prepare(process); defer { pythonFixture.remove() }; try process.run(); let bytes = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0); XCTAssertTrue(errors.fileHandleForReading.readDataToEndOfFile().isEmpty)
+            XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("PRIVATE"))
+            let result = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            let cold = try XCTUnwrap(result["cold"] as? [[[String: Any]]]), appended = try XCTUnwrap(result["appended"] as? [[[String: Any]]])
+            XCTAssertEqual(cold.count, backlog == 0 ? 1 : 2); XCTAssertEqual(appended.count, backlog == 0 ? 1 : 2)
+            XCTAssertEqual(result["coldDeferred"] as? Int, backlog == 0 ? 0 : 1)
+            XCTAssertEqual(result["appendDeferred"] as? Int, backlog == 0 ? 0 : 1)
+            XCTAssertEqual(result["partialReadRoot"] as? Bool, true); XCTAssertEqual(result["partialLeftDirty"] as? Bool, false)
+            var state = ClaudeActivityState(sourceID: "remote-ssh-discovered:fixture"), inbox = CompletionInbox(), policy = AttentionPolicy()
+            for batch in cold { state.consume(ClaudeActivityRecord.encode(["kind": "claudeBatch", "records": batch])!, now: now.addingTimeInterval(30)) }
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.turnID, "engine-turn", order)
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .completed, order)
+            XCTAssertEqual(state.activities.first { $0.threadID == child }?.phase, .completed, order)
+            inbox.observe(state.activities, at: now.addingTimeInterval(30), retention: 60)
+            XCTAssertTrue(inbox.unreadActivities.isEmpty); XCTAssertTrue(policy.activityNotices(state.activities, at: now.addingTimeInterval(30)).isEmpty)
+            for batch in appended { state.consume(ClaudeActivityRecord.encode(["kind": "claudeBatch", "records": batch])!, now: now.addingTimeInterval(30)) }
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.turnID, "next-human-turn", order)
+            XCTAssertEqual(state.activities.first { $0.threadID == parent }?.phase, .running, order)
+        } }
+    }
+}

@@ -1,0 +1,120 @@
+import Foundation
+import XCTest
+@testable import PacerCore
+
+final class ConnectionPagePresentationTests: XCTestCase {
+    private func status(_ connected: Bool = true, sessions: Int = 0, available: Bool? = true,
+                        name: String? = nil, online: Bool? = nil, waiting: Bool = false) -> RuntimeStreamStatus {
+        var value = RuntimeStreamStatus(); value.connected = connected; value.attachedThreads = sessions
+        value.sourceAvailable = available; value.sourceName = name; value.remoteHostOnline = online; value.waitingForSession = waiting
+        return value
+    }
+    func testProblemsComeFirstWhileTwoProvidersShareOneHostRowAndCountsAreDeduplicated() throws {
+        let ssh = ConnectionSource.sshPrefix, wsl = ConnectionSource.wslPrefix + "fixture"
+        let page = ConnectionPagePresentation(enabledProviders: [.codex, .claude], statuses: [
+            .codex: ["local": status(sessions: 1), ssh + "shared": status(sessions: 2), wsl: status(sessions: 3, name: "Linux")],
+            .claude: ["local": status(), ssh + "shared": status(sessions: 8), wsl: status(sessions: 4, name: "Linux")]],
+            claudeAliases: ["shared"], failed: ["shared"], names: ["shared": "Build host"], canRetrySetup: true)
+        XCTAssertEqual(page.state, "retrying"); XCTAssertTrue(page.retry)
+        XCTAssertEqual(page.hosts.count, 2); XCTAssertEqual(page.hosts.first?.name, "Build host")
+        XCTAssertEqual(page.hosts.first?.modules.map(\.provider), ["codex", "claude"])
+        XCTAssertEqual(page.hosts.first?.modules.last?.state, "setupFailed"); XCTAssertTrue(page.hosts.first?.modules.last?.retrySetup == true)
+        XCTAssertEqual(page.sourceCount, 6); XCTAssertEqual(page.sessionCount, 10, "Pending Claude hooks must not add their eight sessions")
+        XCTAssertEqual(page.hosts.last?.modules.map(\.sessions), [3, 4])
+        XCTAssertEqual(page.sources.count, 2, "Host sources must not repeat as individual source rows")
+        let encoded = try JSONEncoder().encode(page), roundTrip = try JSONDecoder().decode(ConnectionPagePresentation.self, from: encoded)
+        XCTAssertEqual(roundTrip, page)
+    }
+    func testClaudeJoinsTheCodexRowOfAHostAddedInDesktop() throws {
+        let managed = ConnectionSource.managedSSHPrefix + "build"
+        let page = ConnectionPagePresentation(enabledProviders: [.codex, .claude], statuses: [
+            .codex: [managed: status(sessions: 2, name: "Build host")], .claude: [managed: status(sessions: 1)]],
+            claudeAliases: ["codex-build"], claudeIDs: ["codex-build": managed], configured: ["codex-build"],
+            names: ["codex-build": "Build host"])
+        XCTAssertEqual(page.hosts.map(\.id), [managed], "One machine is one row")
+        let host = try XCTUnwrap(page.hosts.first)
+        XCTAssertEqual(host.name, "Build host")
+        XCTAssertEqual(host.modules.map(\.provider), ["codex", "claude"])
+        XCTAssertEqual(host.modules.map(\.state), ["connected", "connected"])
+        XCTAssertEqual(page.sessionCount, 3)
+    }
+
+    func testManagedSSHHostsKeepTheirIDsAndNamesAcrossConnectionFailures() throws {
+        let connected = ConnectionSource.managedSSHPrefix + "build", unavailable = ConnectionSource.managedSSHPrefix + "other"
+        let discovered = ConnectionSource.sshPrefix + "build"
+        let page = ConnectionPagePresentation(enabledProviders: [.codex], statuses: [.codex: [
+            "local": status(sessions: 1), connected: status(sessions: 2, name: "Build host"), discovered: status(sessions: 3)
+        ]], unavailableSSH: [connected, unavailable, unavailable, "build"], names: [unavailable: "Build host"])
+
+        XCTAssertEqual(page.state, "retrying")
+        XCTAssertTrue(page.retry)
+        XCTAssertEqual(page.sources.map(\.key), ["local"])
+        XCTAssertEqual(Set(page.hosts.map(\.id)), [connected, unavailable, discovered])
+        XCTAssertEqual(page.sourceCount, 4)
+        XCTAssertEqual(page.sessionCount, 6)
+        let connectedHost = try XCTUnwrap(page.hosts.first { $0.id == connected })
+        XCTAssertEqual(connectedHost.name, "Build host")
+        XCTAssertEqual(connectedHost.modules.first?.key, connected)
+        XCTAssertEqual(connectedHost.modules.first?.state, "connected")
+        let failedHost = try XCTUnwrap(page.hosts.first { $0.id == unavailable })
+        XCTAssertEqual(failedHost.name, "Build host")
+        XCTAssertEqual(failedHost.modules.first?.key, unavailable)
+        XCTAssertEqual(failedHost.modules.first?.state, "retrying")
+        XCTAssertTrue(ConnectionSource.hasSSHFailure(in: [], unavailable: [unavailable]))
+    }
+
+    func testPausedSourcesRemainDistinctAndOptionalCloudDoesNotFailSummary() {
+        let page = ConnectionPagePresentation(enabledProviders: [.codex, .claude], statuses: [
+            .codex: ["local": status()],
+            .claude: ["local": status(), ClaudeCloudProjectState.sourceID: status(false, available: false)]])
+        XCTAssertNotEqual(page.state, "retrying"); XCTAssertFalse(page.retry)
+        XCTAssertEqual(page.sources.first { $0.key == ClaudeCloudProjectState.sourceID }?.module.label, L10n.text("connections.state.cloud_signed_out"))
+        XCTAssertEqual(page.sourceCount, 2, "Optional signed-out Cloud Projects do not count as sources")
+    }
+    func testWSLSetupFailureAndQuotaCapabilityUseOnlyTheSameSourceProvider() {
+        let wsl = ConnectionSource.wslPrefix + "fixture"
+        let statuses: [AgentProvider: [String: RuntimeStreamStatus]] = [.codex: ["local": status(), wsl: status(sessions: 2, name: "Linux")],
+            .claude: ["local": status(), wsl: status(sessions: 3, name: "Linux")]]
+        let failed = ConnectionPagePresentation(enabledProviders: [.codex, .claude], statuses: statuses,
+            setup: [wsl: .failed], canRetrySetup: true, quotaSources: ["codex:" + wsl])
+        XCTAssertEqual(failed.state, "retrying"); XCTAssertEqual(failed.sourceCount, 4); XCTAssertEqual(failed.sessionCount, 2)
+        XCTAssertTrue(failed.hosts.first?.modules.first?.readsQuota == true); XCTAssertFalse(failed.hosts.first?.modules.last?.readsQuota == true)
+        XCTAssertTrue(failed.hosts.first?.modules.last?.retrySetup == true)
+        let configuring = ConnectionPagePresentation(enabledProviders: [.codex, .claude], statuses: statuses, setup: [wsl: .configuring], canRetrySetup: true)
+        XCTAssertEqual(configuring.state, "connecting"); XCTAssertFalse(configuring.hosts.first?.modules.last?.retrySetup == true)
+        let disabled = ConnectionPagePresentation(enabledProviders: [.codex], statuses: statuses, setup: [wsl: .failed], canRetrySetup: true)
+        XCTAssertEqual(disabled.state, "connected"); XCTAssertEqual(disabled.hosts.first?.modules.count, 1)
+        XCTAssertEqual(disabled.sessionCount, 2, "A hidden provider cannot contribute a failure or its session count")
+    }
+    func testCheckingAndDisabledStatesAndAllLanguagesKeepReadableLabels() {
+        XCTAssertEqual(ConnectionPagePresentation(enabledProviders: [.codex], statuses: [:]).state, "checking")
+        XCTAssertEqual(ConnectionPagePresentation(enabledProviders: [], statuses: [:]).state, "disabled")
+        let page = ConnectionPagePresentation(enabledProviders: [.codex], statuses: [.codex: ["local": status(sessions: 1)]])
+        XCTAssertEqual(page.title, L10n.text("connections.summary.ok")); XCTAssertFalse(page.detail.contains("%@"))
+        XCTAssertFalse(page.sources.first?.module.sessionsText.isEmpty == true)
+        for language in [AppLanguage.english, .simplifiedChinese] {
+            XCTAssertNotEqual(L10n.text("connections.summary.ok", language: language), "connections.summary.ok")
+            XCTAssertFalse(L10n.text("connections.sessions_one", 1, language: language).contains("%ld"))
+        }
+    }
+    func testDefaultKeepsSetupFailureLabelForADisconnectedSource() {
+        let source = ConnectionSource.wslPrefix + "fixture"
+        let page = ConnectionPagePresentation(enabledProviders: [.claude], statuses: [
+            .claude: ["local": status(), source: status(false, sessions: 4, name: "Linux")]],
+            setup: [source: .failed], canRetrySetup: true)
+        let module = page.hosts.first?.modules.first
+        XCTAssertEqual(module?.state, "setupFailed"); XCTAssertEqual(module?.label, L10n.text("connections.host.setup_failed"))
+        XCTAssertTrue(module?.retrySetup == true); XCTAssertEqual(module?.sessions, 0)
+        XCTAssertEqual(page.state, "retrying"); XCTAssertEqual(page.sourceCount, 2)
+    }
+    func testTransportProblemsFirstShowsDisconnectionBeforeSetupFailure() {
+        let source = ConnectionSource.wslPrefix + "fixture"
+        let page = ConnectionPagePresentation(enabledProviders: [.claude], statuses: [
+            .claude: ["local": status(), source: status(false, sessions: 4, name: "Linux")]],
+            setup: [source: .failed], canRetrySetup: true, transportProblemsFirst: true)
+        let module = page.hosts.first?.modules.first
+        XCTAssertEqual(module?.state, "retrying"); XCTAssertEqual(module?.label, L10n.text("connections.state.retrying"))
+        XCTAssertFalse(module?.retrySetup == true); XCTAssertEqual(module?.sessions, 0)
+        XCTAssertEqual(page.state, "retrying"); XCTAssertEqual(page.sourceCount, 2)
+    }
+}

@@ -1,0 +1,245 @@
+import Foundation
+import PacerCore
+
+struct EngineClaudeRemoteSetup: Codable, Equatable, Sendable {
+    let sourceID: String
+    let context: String
+    let configured: Bool
+    let inFlight: Bool
+    let canRetry: Bool
+    let message: String?
+    let retryAt: Double?
+}
+
+struct EngineClaudeRemoteServices: Sendable {
+    /// The adapter digest with the progress ring off (false) or on (true).
+    var digest: @Sendable (Bool) -> String
+    /// Installs on one target, with the progress ring on or off. The last
+    /// flag marks an automatic run, which keeps telemetry keys the user
+    /// removed on the host removed.
+    var install: @Sendable (RemoteActivityTarget, Bool, Bool) async throws -> ClaudeHookInstaller.Status
+    var shutdown: @Sendable () async -> Void
+    var loadDigests: @Sendable () -> [String: String]
+    var saveDigests: @Sendable ([String: String]) -> Void
+    /// Why each configured alias's setup kept Pacer's request telemetry off.
+    var loadConflicts: @Sendable () -> [String: ClaudeTelemetryConflict] = { [:] }
+    var saveConflicts: @Sendable ([String: ClaudeTelemetryConflict]) -> Void = { _ in }
+}
+
+/// Selection, version comparison, rechecks and backoff use ClaudeRemoteAutoSetup.
+/// The host owns tasks, source tokens and immutable protocol snapshots.
+actor WindowsClaudeRemoteCoordinator {
+    typealias Update = @Sendable ([EngineClaudeRemoteSetup], UInt64) async -> Void
+    typealias Configured = @Sendable (String, UInt64) async -> Void
+    /// A setup remembers the digest it installs, so a ring switched mid-setup is set up again.
+    /// A quiet job rechecks a current host: its row stays configured and a failure only backs off.
+    private struct Job { let ticket: ApplicationWorkRegistry.Ticket; let target: RemoteActivityTarget; let digest: String; let quiet: Bool }
+    private var work = ApplicationWorkRegistry()
+    private let services: EngineClaudeRemoteServices
+    private let now: @Sendable () -> Date
+    private var configured: [String: String]
+    private var conflicts: [String: ClaudeTelemetryConflict]
+    /// This launch's successful setups by target ID, so current hosts are checked again.
+    private var checkedAt: [String: Date] = [:]
+    private var targets: [RemoteActivityTarget] = []
+    private var statuses: [String: RuntimeStreamStatus] = [:]
+    private var failures: [String: Date] = [:]
+    private var messages: [String: String] = [:]
+    private var jobs: [String: Job] = [:]
+    private var enabled = false, cleaning = false, progressRing = false
+    private var digest: String { services.digest(progressRing) }
+    private var version: UInt64 = 0
+    private var context = UUID().uuidString.lowercased()
+    private var update: Update?
+    private var didConfigure: Configured?
+    private var retryWake: Task<Void, Never>?
+    private var retryDate: Date?
+    private let maximumTargets: Int
+    init(services: EngineClaudeRemoteServices, now: @escaping @Sendable () -> Date = { Date() }, maximumTargets: Int = 8) {
+        self.services = services; self.now = now
+        let configured = services.loadDigests()
+        self.configured = configured; conflicts = services.loadConflicts().filter { configured[$0.key] != nil && $0.value != ClaudeTelemetryConflict.none }
+        self.maximumTargets = min(16, max(1, maximumTargets))
+    }
+    /// Switching the progress ring changes the digest, so connected hosts are set up again.
+    func configure(targets: [RemoteActivityTarget], statuses: [String: RuntimeStreamStatus], enabled: Bool, progressRing: Bool = false,
+                   version: UInt64, update: @escaping Update, didConfigure: @escaping Configured = { _, _ in }) async {
+        let replacing = self.version != version || self.enabled != enabled
+        self.update = update; self.didConfigure = didConfigure; self.enabled = enabled; self.version = version; self.progressRing = progressRing
+        let next = enabled ? Array(targets.prefix(maximumTargets)) : []
+        let changedWSL = self.targets.filter { $0.id.hasPrefix(ConnectionSource.wslPrefix) && !next.contains($0) }.map(\.id)
+        if !changedWSL.isEmpty {
+            context = UUID().uuidString.lowercased()
+            for id in changedWSL { failures[id] = nil; messages[id] = nil; checkedAt[id] = nil }
+        }
+        self.targets = next; self.statuses = statuses
+        if replacing {
+            context = UUID().uuidString.lowercased()
+            retryWake?.cancel(); retryWake = nil; retryDate = nil
+            work.cancel(); jobs.removeAll(); failures.removeAll(); messages.removeAll(); checkedAt.removeAll()
+            if !cleaning {
+                cleaning = true
+                await services.shutdown()
+                cleaning = false
+            }
+        }
+        for (id, job) in Array(jobs) where !self.targets.contains(job.target) { work.cancel(job.ticket.key); jobs[id] = nil }
+        let allowed = Set(self.targets.map(\.id))
+        failures = failures.filter { allowed.contains($0.key) }; messages = messages.filter { allowed.contains($0.key) }
+        checkedAt = checkedAt.filter { allowed.contains($0.key) }
+        reconcile()
+        await publish()
+    }
+    func retry(sourceID: String, context: String) async -> Bool {
+        guard enabled, !cleaning, self.context == context, let target = targets.first(where: { $0.id == sourceID }), jobs[sourceID] == nil else { return false }
+        failures[sourceID] = nil; messages[sourceID] = nil
+        start(target, automatic: false); await publish(); return true
+    }
+    func shutdown() async {
+        enabled = false; targets = []; statuses = [:]; context = UUID().uuidString.lowercased()
+        work.cancel(); jobs.removeAll()
+        retryWake?.cancel(); retryWake = nil; retryDate = nil
+        if !cleaning { cleaning = true; await services.shutdown(); cleaning = false }
+        reconcile(); await publish()
+    }
+    private func reconcile() {
+        guard enabled, !cleaning else { return }
+        for target in ClaudeRemoteAutoSetup.pending(targets: targets, statuses: statuses, configured: configured,
+            digest: digest, failures: failures, inFlight: Set(jobs.keys), now: now(),
+            checkedAt: checkedAt, conflicts: conflicts) { start(target, automatic: true) }
+        scheduleRetryWake()
+    }
+    /// When `pending` next selects a connected, idle target: after its failure
+    /// backoff and, for a host checked this launch, after its recheck interval.
+    /// Nil means it is due now (and was started) or never.
+    private func nextDue(_ target: RemoteActivityTarget) -> Date? {
+        guard jobs[target.id] == nil, let status = statuses[target.id], status.connected, status.sourceAvailable != false else { return nil }
+        var due = failures[target.id]?.addingTimeInterval(ClaudeRemoteAutoSetup.retryInterval)
+        if configured[target.alias] == digest, let last = checkedAt[target.id] {
+            let keptOff = conflicts[target.alias].map { $0 != ClaudeTelemetryConflict.none } ?? false
+            let recheck = last.addingTimeInterval(keptOff ? ClaudeRemoteAutoSetup.conflictRecheckInterval : ClaudeRemoteAutoSetup.recheckInterval)
+            due = max(due ?? recheck, recheck)
+        }
+        return due
+    }
+    private func scheduleRetryWake() {
+        let current = now()
+        let date = targets.compactMap(nextDue).filter { $0 > current }.min()
+        guard date != retryDate else { return }
+        retryWake?.cancel(); retryWake = nil; retryDate = date
+        guard let date else { return }
+        let token = context, seconds = max(0.01, date.timeIntervalSince(now()))
+        retryWake = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) } catch { return }
+            await self?.retryDue(context: token)
+        }
+    }
+    private func retryDue(context: String) async {
+        guard self.context == context, enabled, !cleaning else { return }
+        retryWake = nil; retryDate = nil; reconcile(); await publish()
+    }
+    /// `automatic` runs come from `pending`; one for a host already current is a quiet recheck.
+    private func start(_ target: RemoteActivityTarget, automatic: Bool) {
+        let request = work.begin(.init(.setup, provider: .claude, identifier: target.id), version: version), services = self.services, ring = progressRing
+        let task = Task { [weak self] in
+            do {
+                let status = try await services.install(target, ring, automatic)
+                await self?.finished(target, request: request, result: .success(status))
+            } catch { await self?.finished(target, request: request, result: .failure(error as? ClaudeRemoteSetup.Failure ?? .setupFailed)) }
+        }
+        work.attach(task, to: request)
+        jobs[target.id] = .init(ticket: request, target: target, digest: digest, quiet: automatic && configured[target.alias] == digest)
+    }
+    private func finished(_ target: RemoteActivityTarget, request: ApplicationWorkRegistry.Ticket,
+                          result: Result<ClaudeHookInstaller.Status, ClaudeRemoteSetup.Failure>) async {
+        guard enabled, work.owns(request), request.version == version, let job = jobs[target.id], job.ticket == request, targets.contains(target) else { return }
+        work.finish(request)
+        jobs[target.id] = nil
+        let failure: ClaudeRemoteSetup.Failure?
+        switch result {
+        case .success(let status):
+            failure = nil
+            let previous = (configured, conflicts)
+            configured[target.alias] = job.digest
+            configured = Dictionary(uniqueKeysWithValues: configured.sorted { $0.key < $1.key }.suffix(32).map { ($0.key, $0.value) })
+            conflicts = conflicts.filter { configured[$0.key] != nil }
+            if configured[target.alias] != nil {
+                conflicts[target.alias] = status.telemetryConflictReason == ClaudeTelemetryConflict.none ? nil : status.telemetryConflictReason
+            }
+            if configured != previous.0 { services.saveDigests(configured) }
+            if conflicts != previous.1 { services.saveConflicts(conflicts) }
+            failures[target.id] = nil; messages[target.id] = nil; checkedAt[target.id] = now()
+        case .failure(let error):
+            failure = error
+            guard error != .cancelled else { await publish(); return }
+            failures[target.id] = now()
+            // A quiet recheck of a current host only backs off; its row stays as it was.
+            if !job.quiet { messages[target.id] = L10n.text(error == .missingHome ? "provider.remote_source_missing" : "provider.remote_configure_failed") }
+        }
+        // A ring switched during this setup leaves the host behind; set it up again.
+        if failure == nil, job.digest != digest { reconcile() } else { scheduleRetryWake() }
+        await publish()
+        if failure == nil { await didConfigure?(target.id, request.version) }
+    }
+    private func publish() async {
+        let rows = targets.map { target in
+            // A quiet recheck is not shown as configuring, and its failure shows no retry time.
+            EngineClaudeRemoteSetup(sourceID: target.id, context: context, configured: configured[target.alias] == digest,
+                inFlight: jobs[target.id].map { !$0.quiet } ?? false, canRetry: enabled && !cleaning && jobs[target.id] == nil,
+                message: messages[target.id], retryAt: messages[target.id] == nil ? nil
+                    : failures[target.id].map { $0.addingTimeInterval(ClaudeRemoteAutoSetup.retryInterval).timeIntervalSince1970 })
+        }
+        await update?(rows, version)
+    }
+}
+
+final class WindowsClaudeSetupOperation: ClaudeRemoteSetupOperation, @unchecked Sendable {
+    private let executable: URL, arguments: [String], environment: [String: String]
+    private let lock = NSLock()
+    private var bytes = Data(), problem: ClaudeRemoteSetup.Failure?, child: (any ChildProcessConnection)?
+    private let wsl: WindowsWSLServices?
+    private var sourceIsCurrent: @Sendable () -> Bool = { true }
+    init(executable: URL, arguments: [String], environment: [String: String], wsl: WindowsWSLServices? = nil) {
+        self.executable = executable; self.arguments = arguments; self.environment = environment
+        self.wsl = wsl
+    }
+    var failure: ClaudeRemoteSetup.Failure? { lock.lock(); defer { lock.unlock() }; return problem }
+    func start() throws {
+        lock.lock(); defer { lock.unlock() }
+        guard problem == nil, child == nil else { throw problem ?? .connectionFailed }
+        if arguments.first == "--pacer-wsl" {
+            // Claude's hooks or Codex's progress tool, each in its own provider route.
+            guard arguments.count == 4, let provider = AgentProvider(rawValue: arguments[1]), [.claude, .codex].contains(provider), let wsl,
+                  let profile = wsl.registry.profile(id: arguments[2], provider: provider),
+                  let invocation = WindowsWSLInvocation(profile: profile, provider: provider, command: arguments[3], setup: true) else { throw ClaudeRemoteSetup.Failure.invalidTarget }
+            sourceIsCurrent = { wsl.registry.profile(id: profile.id, provider: provider) == profile }
+            child = try wsl.start(.init(executable: wsl.executable, arguments: invocation.arguments, environment: WindowsWSLInvocation.environment(environment)),
+                invocation.input, { [weak self] in self?.receive($0) }, {})
+            // WSL's small supervisor owns the Linux child group. Keep stdin
+            // open until completion; cancellation EOF then kills only that group.
+            return
+        }
+        let invocation = try WindowsSSHInvocation(arguments: arguments)
+        let process = try WindowsHelperProcess(.init(executable: executable, arguments: invocation.arguments, environment: environment),
+            initialInput: invocation.input, privateErrors: true, output: { [weak self] in self?.receive($0) }, ended: {})
+        child = process; process.finishInput()
+    }
+    private func receive(_ data: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard bytes.count + data.count <= 4096 else { problem = .invalidResponse; return }
+        bytes.append(data)
+    }
+    func result() throws -> (data: Data, exitStatus: Int32)? {
+        lock.lock(); defer { lock.unlock() }
+        if let problem { throw problem }
+        guard sourceIsCurrent() else { throw ClaudeRemoteSetup.Failure.cancelled }
+        guard let child, !child.isRunning, child.ioClosed.isFinished else { return nil }
+        guard let status = child.terminationStatus else { throw ClaudeRemoteSetup.Failure.connectionFailed }
+        return (bytes, status)
+    }
+    func abort(_ failure: ClaudeRemoteSetup.Failure) {
+        lock.lock(); problem = failure; let process = child; lock.unlock()
+        process?.close(); process?.terminateImmediately()
+    }
+    func close() { lock.lock(); let process = child; lock.unlock(); process?.close() }
+}

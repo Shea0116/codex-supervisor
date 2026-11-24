@@ -1,0 +1,177 @@
+import XCTest
+@testable import PacerCore
+@testable import PacerIsland
+import PacerTestSupport
+
+@MainActor
+final class DemoSettingsTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private let arguments = ["--demo", "--demo-claude", "--demo-deepseek", "--demo-cloud"]
+
+    private func defaults() throws -> UserDefaults {
+        let domain = testDefaultsName("DemoSettingsTests")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        addTeardownBlock { removeTestDefaults(domain) }
+        defaults.set("/synthetic/demo/codex", forKey: "codexHome")
+        defaults.set("/synthetic/demo/claude", forKey: "claudeHome")
+        defaults.set("/synthetic/demo/deepseek", forKey: "deepseekHome")
+        defaults.set(false, forKey: "monitorSSH"); defaults.set(false, forKey: "monitorRemoteControl")
+        return defaults
+    }
+
+    func testSettingsPreserveDemoTasksStageRatesAndRequests() async throws {
+        let defaults = try defaults(), clock = now
+        let model = IslandModel(demo: true, demoClock: { clock }, demoArguments: arguments, defaults: defaults)
+        XCTAssertEqual(Set(model.enabledProviders), Set(HarnessRegistry.legacyIDs), "Demo automatic choices use synthetic installations")
+        XCTAssertEqual(model.moduleLibrary(.load(from: defaults)).collapsed.map(\.provider), [.workbuddy, .workbuddyAI],
+                       "Other modules read as not found in the demo until turned on")
+        for stage in DemoTaskStage.allCases {
+            model.setDemoStage(stage)
+            let before = model.activities.sorted { $0.id < $1.id }
+            let requests = model.pendingInputRequests
+            let rate = model.rate
+            let unread = Set(model.pendingCompletions.map(\.id))
+            XCTAssertFalse(before.isEmpty)
+            for sourceChanged in [false, true] {
+                defaults.set(!defaults.bool(forKey: "hideProjects"), forKey: "hideProjects")
+                defaults.set("/synthetic/demo/home", forKey: "codexHome")
+                defaults.set(false, forKey: "monitorSSH")
+                model.applySettings(sourceChanged: sourceChanged)
+                XCTAssertEqual(model.activities.sorted { $0.id < $1.id }, before)
+                XCTAssertEqual(model.pendingInputRequests, requests)
+                XCTAssertEqual(model.rate, rate)
+                XCTAssertEqual(Set(model.pendingCompletions.map(\.id)), unread)
+            }
+        }
+        model.setDemoStage(.thinking)
+        XCTAssertTrue(model.activities.filter { $0.provider == .codex }.allSatisfy { $0.phase == .running },
+            "The same synthetic turn can replay a running stage after completion")
+        await model.shutdown()
+    }
+
+    func testSourceFixtureKeepsItsInjectedClockWithoutStartingDemoTasks() async throws {
+        let defaults = try defaults(), clock = now
+        let model = IslandModel(demo: true, demoClock: { clock }, demoArguments: nil, defaults: defaults)
+        XCTAssertEqual(model.now, clock)
+        XCTAssertTrue(model.activities.isEmpty)
+        XCTAssertEqual(model.providerQuota(.codex)?.capturedAt, clock)
+        XCTAssertEqual(model.providerQuota(.claude)?.capturedAt, clock)
+        await model.shutdown()
+    }
+
+    func testEveryModuleCombinationFiltersDemoTasksRequestsAndEndings() async throws {
+        let clock = now
+        for mask in 0..<8 {
+            let defaults = try defaults()
+            var modules = ProviderModules()
+            let enabled = Set(HarnessRegistry.legacyIDs.enumerated().compactMap { index, provider in
+                mask & (1 << index) == 0 ? nil : provider
+            })
+            for provider in HarnessRegistry.legacyIDs { modules.setMode(enabled.contains(provider) ? .enabled : .disabled, for: provider) }
+            modules.save(to: defaults)
+            let model = IslandModel(demo: true, demoClock: { clock }, demoArguments: arguments, defaults: defaults)
+            for stage in DemoTaskStage.allCases {
+                model.setDemoStage(stage)
+                XCTAssertEqual(Set(model.activities.map(\.provider)), enabled)
+                XCTAssertTrue(model.visibleActivities.allSatisfy { enabled.contains($0.provider) })
+                XCTAssertTrue(model.pendingInputRequests.allSatisfy { enabled.contains($0.provider) })
+                XCTAssertTrue(model.pendingCompletions.allSatisfy { enabled.contains($0.provider) })
+                if stage == .tool { XCTAssertEqual(model.pendingInputRequests.isEmpty, !enabled.contains(.claude)) }
+            }
+            await model.shutdown()
+        }
+    }
+
+    func testModuleChangesRestoreTheSameDemoSnapshotAndUnreadState() async throws {
+        let defaults = try defaults(), clock = now
+        let model = IslandModel(demo: true, demoClock: { clock }, demoArguments: arguments, defaults: defaults)
+        for stage in [DemoTaskStage.tool, .completed] {
+            model.setDemoStage(stage)
+            let before = model.activities.sorted { $0.id < $1.id }, requests = model.pendingInputRequests
+            let unread = Set(model.pendingCompletions.map(\.id))
+            for provider in HarnessRegistry.legacyIDs {
+                var modules = ProviderModules()
+                modules.setMode(.disabled, for: provider); modules.save(to: defaults)
+                model.applySettings(sourceChanged: false)
+                XCTAssertEqual(model.activities.sorted { $0.id < $1.id }, before.filter { $0.provider != provider })
+                XCTAssertFalse(model.pendingInputRequests.contains { $0.provider == provider })
+                XCTAssertFalse(model.pendingCompletions.contains { $0.provider == provider })
+                ProviderModules().save(to: defaults)
+                model.applySettings(sourceChanged: false)
+                XCTAssertEqual(model.activities.sorted { $0.id < $1.id }, before)
+                XCTAssertEqual(model.pendingInputRequests, requests)
+                XCTAssertEqual(Set(model.pendingCompletions.map(\.id)), unread)
+            }
+        }
+        await model.shutdown()
+    }
+}
+
+@MainActor
+final class DemoWorkBuddyTests: XCTestCase {
+    func testDemoWorkBuddyFlagTurnsTheModuleOnWithItsTaskAndDial() throws {
+        let domain = testDefaultsName("demo-workbuddy-tests")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { removeTestDefaults(domain) }
+        let plain = IslandModel(demo: true, demoArguments: ["--demo"], defaults: defaults)
+        XCTAssertFalse(plain.isModuleEnabled(.workbuddy), "The reference demo keeps WorkBuddy off and folded")
+        XCTAssertNil(plain.harnessAccount(.workbuddy)?.reading)
+        let model = IslandModel(demo: true, demoArguments: ["--demo", "--demo-workbuddy"], defaults: defaults)
+        XCTAssertTrue(model.isModuleEnabled(.workbuddy))
+        model.setDemoStage(.thinking)
+        XCTAssertTrue(model.activities.contains { $0.provider == .workbuddy }, "Its demo task joins the others")
+        XCTAssertNotNil(model.harnessAccount(.workbuddy)?.reading, "Its credits dial shows the demo bill")
+        XCTAssertNotNil(model.harnessWeek(.workbuddy), "History shows its demo week")
+        XCTAssertNil(plain.harnessWeek(.workbuddy))
+        XCTAssertNil(defaults.string(forKey: "providerModule.workbuddy"), "The flag saves no module choice")
+    }
+
+    func testCreditsStayThroughSleepAndClearOnlyWhenTheModuleTurnsOff() async throws {
+        let domain = testDefaultsName("demo-workbuddy-sleep")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        let model = IslandModel(demo: true, demoArguments: ["--demo", "--demo-workbuddy"], defaults: defaults)
+        defer { removeTestDefaults(domain) }
+        let connection = try XCTUnwrap(model.harnessAccount(.workbuddy))
+        let bill = try XCTUnwrap(connection.credits)
+        connection.suspend()
+        XCTAssertEqual(connection.credits, bill, "Sleep keeps the last bill")
+        connection.configure(enabled: true)
+        XCTAssertEqual(connection.credits, bill, "Waking keeps it until a read replaces or dims it")
+        connection.configure(enabled: false, keepsReading: true)
+        XCTAssertEqual(connection.credits, bill)
+        connection.configure(enabled: true)
+        connection.configure(enabled: false)
+        XCTAssertNil(connection.credits, "Turning the module off forgets the account's bill")
+        XCTAssertEqual(L10n.moduleText("main.history.future-module_week", fallback: "Future"), "Future", "A key this version lacks shows the module's name")
+        XCTAssertEqual(L10n.moduleText("main.history.workbuddy-ai_week", fallback: "x"), L10n.text("main.history.workbuddy-ai_week"))
+        await model.shutdown()
+    }
+
+    func testTheBarMarksCreditsLowAtTheModulesOwnLine() async throws {
+        let domain = testDefaultsName("demo-workbuddy-low")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        let model = IslandModel(demo: true, demoArguments: ["--demo", "--demo-workbuddy"], defaults: defaults)
+        defer { removeTestDefaults(domain) }
+        XCTAssertEqual(model.compactCredits.first { $0.provider == .workbuddy }?.low, false, "The demo bill is well above the default line")
+        model.setCreditSettings(.workbuddy, HarnessCreditsSettings(center: .available, bar: .available, lowCredits: 1_000_000,
+                                                                  expiryReminder: true, expiryDays: 3))
+        XCTAssertEqual(model.compactCredits.first { $0.provider == .workbuddy }?.low, true, "The user's own low line colors the bar")
+        await model.shutdown()
+    }
+
+    func testRestartingOverARunningTaskAsksFirstAndADemoNeverQuitsTheApp() async throws {
+        let domain = testDefaultsName("demo-workbuddy-restart")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        let model = IslandModel(demo: true, demoArguments: ["--demo", "--demo-workbuddy"], defaults: defaults)
+        defer { removeTestDefaults(domain) }
+        model.setDemoStage(.thinking)
+        XCTAssertTrue(model.visibleActivities.contains { $0.provider == .workbuddy && $0.phase == .running })
+        await model.restartHarness(.workbuddy)
+        XCTAssertEqual(model.harnessRestarts[.workbuddy], .confirm, "The first click over a running task only asks")
+        await model.restartHarness(.workbuddy)
+        XCTAssertEqual(model.harnessRestarts[.workbuddy], .confirm, "Confirmed, a demo still leaves the real app alone")
+        model.forgetHarnessPage(.workbuddy)
+        XCTAssertNil(model.harnessRestarts[.workbuddy], "The question goes once the app quits")
+        await model.shutdown()
+    }
+}

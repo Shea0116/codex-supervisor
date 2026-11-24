@@ -1,0 +1,103 @@
+#ifndef PACER_WINDOWS_SUPPORT_H
+#define PACER_WINDOWS_SUPPORT_H
+#include <stddef.h>
+#include <stdint.h>
+int pacer_sha256(const uint8_t *bytes, size_t count, uint8_t output[32]);
+int pacer_replace_file(const uint16_t *source, const uint16_t *destination);
+typedef struct {
+    uint64_t volume, file_low, file_high, size, modified, created;
+    int regular, directory;
+} pacer_file_metadata;
+int pacer_read_file_metadata(const uint16_t *path, int follow_links, pacer_file_metadata *metadata);
+int pacer_read_credential(const uint16_t *name, uint8_t *bytes, size_t capacity);
+int pacer_write_credential(const uint16_t *name, const uint8_t *bytes, size_t count);
+int pacer_remove_credential(const uint16_t *name);
+int pacer_normalize_ipv6(const char *input, char *output, size_t capacity);
+int64_t pacer_read_stdin(uint8_t *bytes, size_t capacity);
+int pacer_named_semaphore_exists(const uint16_t *name);
+typedef void (*pacer_change_callback)(void *context, int valid);
+/* flags: 1 invalidated, 2 directory entries changed. closed releases context. */
+void *pacer_watch_directory(const uint16_t *path, int is_directory, void *context,
+                           pacer_change_callback callback, void (*closed)(void *));
+void pacer_close_directory_watch(void *watch);
+/* Parses one ReadDirectoryChangesW result for a watch of name, or of a whole
+   directory when name is NULL. Returns 1 when it concerns the watch and adds
+   the callback flags. */
+int pacer_directory_parse(const void *buffer, uint32_t count, const uint16_t *name, int *flags);
+// 1 registered, 0 empty, -1 unknown. A notification only invalidates the list.
+int pacer_wsl_registration_presence(void);
+void *pacer_watch_wsl_registrations(void *context, pacer_change_callback callback, void (*closed)(void *));
+void pacer_close_wsl_registration_watch(void *watch);
+void *pacer_telemetry_listen(uint16_t port, int backlog, uint16_t *bound_port, void *context,
+                            void (*accepted)(void *, void *), void (*closed)(void *));
+void pacer_telemetry_stop(void *listener);
+int pacer_telemetry_read(void *client, uint8_t *bytes, size_t capacity, uint32_t timeout_ms);
+int pacer_telemetry_write(void *client, const uint8_t *bytes, size_t count);
+void pacer_telemetry_interrupt(void *client);
+void pacer_telemetry_close(void *client);
+// One WinHTTP GET response without redirects, cookies or credentials. A null
+// proxy connects directly. Open waits for the response headers. Cancel is safe
+// from any thread during open or read; close runs after those calls return.
+// -1 = failure, -2 = timeout, -3 = cancelled. Read returns 0 at the end.
+void *pacer_http_stream_create(void);
+int pacer_http_stream_open(void *stream, const uint16_t *host, uint16_t port, int secure, const uint16_t *path,
+                           const uint16_t *headers, const uint16_t *agent, const uint16_t *proxy,
+                           uint32_t timeout_ms, uint32_t *status, int websocket);
+int pacer_http_stream_header(void *stream, const uint16_t *name, uint16_t *value, size_t capacity);
+int pacer_http_stream_raw_headers(void *stream, uint16_t *value, size_t capacity);
+int64_t pacer_http_stream_read(void *stream, uint8_t *bytes, size_t capacity, uint32_t timeout_ms);
+int pacer_websocket_send(void *stream, const uint8_t *bytes, size_t size, uint32_t timeout_ms);
+int64_t pacer_websocket_read(void *stream, uint8_t *bytes, size_t capacity, uint32_t timeout_ms, int *complete);
+void pacer_http_stream_cancel(void *stream);
+void pacer_http_stream_close(void *stream);
+// A loopback HTTP proxy that tunnels one request target through SOCKS4 (1),
+// SOCKS4a (2), SOCKS5 (3), SOCKS5h (4) or an HTTP proxy with Basic credentials
+// (5). It accepts CONNECT or an absolute http:// request only for that target.
+// Close stops it; threads release it as they exit. Strings are UTF-8.
+void *pacer_proxy_relay_start(int kind, const char *host, uint16_t port, const char *username, const char *password,
+                              int credentials, const char *target_host, uint16_t target_port, uint32_t timeout_ms,
+                              uint16_t *bound_port);
+void pacer_proxy_relay_close(void *relay);
+int pacer_is_windows_executable(const uint16_t *path);
+int pacer_windows_product_matches(const uint16_t *path, const uint16_t *product, const uint16_t *company);
+int pacer_harness_registry_path(size_t index, uint16_t *path, size_t capacity);
+int pacer_url_handler_path(const uint16_t *scheme, size_t index, uint16_t *path, size_t capacity);
+int pacer_codex_package_path(size_t index, uint16_t *path, size_t capacity);
+int pacer_package_path(const uint16_t *family, size_t index, uint16_t *path, size_t capacity);
+typedef struct { uint32_t pid; uint32_t parent; uint64_t started; } pacer_process_identity;
+// Creation times use the original 100 ns FILETIME ticks, never rounded dates.
+int pacer_process_details(uint32_t pid, uint64_t started, pacer_process_identity *identity,
+                          uint16_t *image, size_t image_capacity);
+int pacer_process_image(uint32_t pid, uint64_t started, pacer_process_identity *identity,
+                        uint16_t *image, size_t image_capacity);
+int pacer_process_parents(pacer_process_identity *identities, size_t capacity);
+// Processes whose image file name equals `name`, ignoring case; started is 0.
+int pacer_process_named(const uint16_t *name, pacer_process_identity *identities, size_t capacity);
+// 1 when the exact current-user/session process runs in a package of this family.
+int pacer_process_package_family(uint32_t pid, uint64_t started, const uint16_t *family);
+int pacer_process_durable_environment(uint32_t pid, uint64_t started, uint16_t *environment, size_t capacity);
+typedef struct { uint64_t volume, low, high, modified, size; } pacer_application_stamp;
+int pacer_process_application(uint32_t pid, uint64_t started, uint16_t *image, size_t capacity,
+                              uint16_t *application_id, size_t id_capacity, pacer_application_stamp *stamp);
+int pacer_application_open(const uint16_t *image, const uint16_t *application_id, const pacer_application_stamp *stamp);
+// Metadata only: current-user/session writers of this exact file identity.
+// A negative result means ownership could not be established.
+int pacer_file_writers(const uint16_t *path, pacer_process_identity *writers, size_t capacity);
+// 1 when the handle capture behind the writer checks reports an object of this
+// process whose name ends with `name`; 0 when it does not, -1 when it failed.
+int pacer_handle_capture_names(const uint16_t *name);
+int pacer_scoped_file_writers(const uint16_t *home, const uint16_t *path, pacer_process_identity *writers, size_t capacity);
+typedef struct { uint64_t file_volume, file_low, file_high, root_volume, root_low, root_high; } pacer_source_file_identity;
+int pacer_source_file_stamp(const uint16_t *home, const uint16_t *path, pacer_source_file_identity *stamp);
+int pacer_same_directory(const uint16_t *first, const uint16_t *second);
+// Opens `file` for a crash report and installs the handlers that write it when
+// the engine stops on an unhandled exception, a damaged heap or abort(). The file
+// disappears with the process unless a report is written. `header` holds ASCII
+// lines for the top of the report. A report holds module names, offsets, register
+// values and module identities: no memory contents, paths or arguments.
+int pacer_crash_report_install(const uint16_t *file, const char *header);
+int pacer_process_alive(uint32_t pid, uint64_t started);
+// An existing top-level window of the exact current-user/session process.
+// activate == 0 only observes availability; this never starts a process.
+int pacer_process_window(uint32_t pid, uint64_t started, int activate);
+#endif

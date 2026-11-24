@@ -1,0 +1,86 @@
+import Foundation
+import CryptoKit
+
+/// Persists acknowledged endings without retaining session, account or path text.
+public struct CompletionDismissalStore: Sendable {
+    /// Only a hashed source identity and a server timestamp survive. This
+    /// bridges the same bounded idle-to-resolved transition across a relaunch.
+    package struct CloudEnding: Codable, Equatable, Sendable {
+        let source: String
+        let mark: Date
+    }
+    private struct Envelope: Codable {
+        let version: Int
+        let digests: [String]
+        let cloudEndings: [CloudEnding]?
+    }
+    private static let maximumEntries = 512
+    private static let maximumBytes = 64 * 1024
+    private static let maximumCloudEndings = 128
+    private let fileURL: URL
+
+    private let files: any PlatformFileSystem
+    private let preservesDamagedFile: Bool
+    public init(fileURL: URL, files: any PlatformFileSystem, preservesDamagedFile: Bool = false) {
+        self.fileURL = fileURL; self.files = files; self.preservesDamagedFile = preservesDamagedFile
+    }
+
+    package static func digest(_ fields: [String]) -> String {
+        // Length prefixes make opaque identifiers unambiguous without storing them.
+        var data = Data()
+        for field in fields {
+            let bytes = Data(field.utf8)
+            data.append(Data("\(bytes.count):".utf8)); data.append(bytes)
+        }
+        return hex(SHA256.hash(data: data))
+    }
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+    /// Lowercase hex without a formatter call per byte; endings are hashed on every pass.
+    package static func hex<Bytes: Sequence>(_ bytes: Bytes) -> String where Bytes.Element == UInt8 {
+        var text: [UInt8] = []
+        text.reserveCapacity(64)
+        for byte in bytes { text.append(hexDigits[Int(byte >> 4)]); text.append(hexDigits[Int(byte & 0x0f)]) }
+        return String(decoding: text, as: UTF8.self)
+    }
+
+    func loadDigests() -> [String] { load().digests }
+
+    func load() -> (digests: [String], cloudEndings: [CloudEnding]) {
+        guard let envelope = readEnvelope() else { return ([], []) }
+        return (envelope.digests, envelope.cloudEndings ?? [])
+    }
+    private func readEnvelope() -> Envelope? {
+        guard let metadata = files.metadata(fileURL), metadata.isRegularFile, metadata.size <= Self.maximumBytes,
+              let data = try? files.read(fileURL, offset: 0, maximumBytes: Self.maximumBytes + 1), data.count <= Self.maximumBytes,
+              let envelope = try? JSONDecoder().decode(Envelope.self, from: data), envelope.version == 1,
+              envelope.digests.count <= Self.maximumEntries,
+              Set(envelope.digests).count == envelope.digests.count,
+              envelope.digests.allSatisfy(Self.validDigest),
+              Self.validCloudEndings(envelope.cloudEndings ?? []) else { return nil }
+        return envelope
+    }
+
+    @discardableResult
+    package func saveDigests(_ digests: [String], cloudEndings: [CloudEnding] = []) -> Bool {
+        guard digests.count <= Self.maximumEntries, Set(digests).count == digests.count,
+              digests.allSatisfy(Self.validDigest), Self.validCloudEndings(cloudEndings),
+              let data = try? JSONEncoder().encode(Envelope(version: 1, digests: digests,
+                  cloudEndings: cloudEndings.isEmpty ? nil : cloudEndings)),
+              data.count <= Self.maximumBytes else { return false }
+        if preservesDamagedFile, files.metadata(fileURL) != nil || FileManager.default.fileExists(atPath: fileURL.path) {
+            guard readEnvelope() != nil else { return false }
+        }
+        return files.replace(fileURL, with: data)
+    }
+
+    static func bounded(_ digests: [String]) -> [String] { Array(digests.suffix(maximumEntries)) }
+    static func boundedCloudEndings(_ endings: [CloudEnding]) -> [CloudEnding] { Array(endings.suffix(maximumCloudEndings)) }
+    private static func validCloudEndings(_ endings: [CloudEnding]) -> Bool {
+        endings.count <= maximumCloudEndings && Set(endings.map(\.source)).count == endings.count && endings.allSatisfy {
+            validDigest($0.source) && $0.mark.timeIntervalSince1970.isFinite
+        }
+    }
+    private static func validDigest(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+}

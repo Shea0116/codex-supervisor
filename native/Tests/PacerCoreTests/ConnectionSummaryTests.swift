@@ -1,0 +1,105 @@
+import XCTest
+@testable import PacerCore
+
+final class ConnectionSummaryTests: XCTestCase {
+    private let prefix = ConnectionSource.sshPrefix
+    private func status(_ connected: Bool, sessions: Int = 0, available: Bool? = nil) -> RuntimeStreamStatus {
+        var value = RuntimeStreamStatus()
+        value.connected = connected; value.attachedThreads = sessions; value.sourceAvailable = available
+        return value
+    }
+    private func summary(_ statuses: [AgentProvider: [String: RuntimeStreamStatus]], aliases: [String] = [],
+                         configured: Set<String> = [], configuring: Set<String> = [], failed: Set<String> = [],
+                         unavailable: [String] = [], enabled: [AgentProvider] = [.codex, .claude]) -> ConnectionSummary {
+        ConnectionSummary(enabledProviders: enabled,
+            sources: ConnectionSource.sources(statuses: statuses, unavailableSSH: unavailable, names: [:]),
+            hosts: SSHHost.hosts(codex: enabled.contains(.codex) ? statuses[.codex] ?? [:] : nil, unavailableCodex: unavailable,
+                claude: enabled.contains(.claude) ? statuses[.claude] ?? [:] : nil, claudeAliases: aliases,
+                configured: configured, configuring: configuring, failed: failed))
+    }
+
+    func testUnpublishedAndConfiguringTargetsPreventAllConnectedSummary() {
+        var statuses: [AgentProvider: [String: RuntimeStreamStatus]] = [
+            .codex: ["local": status(true, sessions: 2)], .claude: ["local": status(true, sessions: 1)]]
+        let waiting = summary(statuses, aliases: ["new-host"])
+        XCTAssertEqual(waiting.state, .connecting(1), "A configured target without a stream status still counts")
+        XCTAssertEqual(waiting.sources, 3)
+        XCTAssertEqual(waiting.sessions, 3)
+        statuses[.claude]?[prefix + "new-host"] = status(true, sessions: 8, available: true)
+        for configuring: Set<String> in [[], ["new-host"]] {
+            let pending = summary(statuses, aliases: ["new-host"], configuring: configuring)
+            XCTAssertEqual(pending.state, .connecting(1), "A connected collector is not ready while its hooks are being configured")
+            XCTAssertEqual(pending.sources, 3, "The host row and stream describe the same source")
+            XCTAssertEqual(pending.sessions, 3, "Use the same effective state and session count as the host row")
+        }
+        let ready = summary(statuses, aliases: ["new-host"], configured: ["new-host"])
+        XCTAssertEqual(ready.state, .connected)
+        XCTAssertEqual(ready.sources, 3)
+        XCTAssertEqual(ready.sessions, 11)
+    }
+
+    func testTelemetryNoteShowsOnlyOnConnectedHostsWithoutExactSpans() {
+        var exact = status(true, sessions: 1, available: true); exact.exactRequestSpans = true
+        let claude = [prefix + "estimated": status(true, sessions: 1, available: true), prefix + "exact": exact,
+                      prefix + "configuring": status(true, available: true), prefix + "offline": status(false)]
+        let aliases = ["estimated", "exact", "configuring", "offline", "clear"]
+        let hosts = SSHHost.hosts(codex: nil, unavailableCodex: [], claude: claude, claudeAliases: aliases,
+            configured: ["estimated", "exact", "offline", "clear"], configuring: ["configuring"], failed: [],
+            telemetryConflicts: ["estimated": .managed, "exact": .existing, "configuring": .existing, "offline": .managed])
+        let notes = Dictionary(uniqueKeysWithValues: hosts.map { ($0.alias, $0.claudeTelemetryNote) })
+        XCTAssertEqual(notes, ["estimated": .managed, "exact": .none, "configuring": .none, "offline": .none, "clear": .none],
+            "Only a connected host whose speeds are still estimated shows why")
+    }
+
+    func testPausedSourcesAndMissingLocalProviderCannotAppearConnected() {
+        let statuses: [AgentProvider: [String: RuntimeStreamStatus]] = [
+            .codex: ["local": status(true, sessions: 2)],
+            .claude: ["local": status(true), prefix + "no-claude": status(false, sessions: 8, available: false)]]
+        let paused = summary(statuses, aliases: ["no-claude"])
+        XCTAssertEqual(paused.state, .paused(1), "A reachable host without Claude is paused, not a failure or success")
+        XCTAssertEqual(paused.sessions, 2)
+        let missing = summary([.codex: ["local": status(true)]])
+        XCTAssertEqual(missing.state, .connecting(1), "A missing enabled local provider must be included")
+        XCTAssertEqual(missing.sources, 2)
+        let deepseek = summary([.codex: ["local": status(true)], .claude: ["local": status(true)]], enabled: HarnessRegistry.legacyIDs)
+        XCTAssertEqual(deepseek.state, .connecting(1), "DeepSeek's local sessions count like the other modules'")
+        XCTAssertEqual(deepseek.sources, 3)
+        XCTAssertEqual(summary([.codex: ["local": status(true)], .claude: ["local": status(true)], .deepseek: ["local": status(true, sessions: 4)]],
+            enabled: HarnessRegistry.legacyIDs).sessions, 4)
+        XCTAssertEqual(summary([:]).state, .checking)
+        let disabled = summary(statuses, aliases: ["no-claude"], enabled: [])
+        XCTAssertEqual(disabled.state, .disabled)
+        XCTAssertEqual(disabled.sources, 0)
+        XCTAssertEqual(disabled.sessions, 0)
+    }
+
+    func testSummaryDeduplicatesFailuresPerProviderAndHostAndKeepsUnpublishedFailures() {
+        let statuses: [AgentProvider: [String: RuntimeStreamStatus]] = [
+            .codex: ["local": status(true, sessions: 2), prefix + "shared": status(false)],
+            .claude: ["local": status(true), prefix + "shared": status(false)]]
+        let result = summary(statuses, aliases: ["shared", "setup-only"], failed: ["shared", "setup-only"], unavailable: ["shared"])
+        XCTAssertEqual(result.state, .retrying(3), "Duplicate status, unavailable and setup records count once per provider/host")
+        XCTAssertEqual(result.sources, 5)
+        XCTAssertEqual(result.sessions, 2)
+        let retry = summary(statuses, aliases: ["shared", "setup-only"], configuring: ["setup-only"], failed: ["setup-only"], unavailable: ["shared"])
+        XCTAssertEqual(retry.state, .retrying(2), "A setup retry in flight replaces its earlier failure")
+        let claudeOnly = summary(statuses, aliases: ["shared"], enabled: [.claude])
+        XCTAssertEqual(claudeOnly.state, .retrying(1))
+        XCTAssertEqual(claudeOnly.sources, 2, "Disabled providers do not contribute sources")
+    }
+
+    func testDeviceNamesSurviveZeroSessionsAndOfflineIsNotAConnectionFailure() throws {
+        var work = status(true, sessions: 1), notebook = status(false)
+        work.sourceName = "Workstation"; work.remoteHostOnline = true
+        notebook.sourceName = "Notebook"; notebook.remoteHostOnline = false
+        let rows = ConnectionSource.sources(statuses: [.codex: ["local": status(true),
+            ConnectionSource.wslPrefix + "work": work, ConnectionSource.wslPrefix + "notebook": notebook]], unavailableSSH: [], names: [:])
+        let offline = try XCTUnwrap(rows.first { $0.name == "Notebook" })
+        XCTAssertEqual(offline.state, .offline)
+        XCTAssertFalse(notebook.hasConnectionFailure)
+        let result = ConnectionSummary(enabledProviders: [.codex], sources: rows, hosts: [])
+        XCTAssertEqual(result.sources, 3)
+        XCTAssertEqual(result.sessions, 1)
+        XCTAssertEqual(result.state, .offline(1), "An offline device must not imply that the running source is waiting for a session")
+    }
+}

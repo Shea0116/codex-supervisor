@@ -1,0 +1,195 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using CodexPacer.Windows;
+
+internal static class HarnessNavigationChecks
+{
+    internal static async Task Run(string language, bool motion, string output)
+    {
+        string fixture = Environment.GetEnvironmentVariable("PACER_HARNESS_DESKTOP_FIXTURE")
+            ?? throw new InvalidOperationException("The synthetic Harness metadata fixture is required.");
+        var native = new WindowsHarnessApplication(Path.Combine(AppContext.BaseDirectory, "Engine"));
+        var opened = new List<string>(); bool launchSucceeds = false, installed = true;
+        var apps = new WindowsDesktopApplications(_ => false, _ => false, () => installed ? fixture : null, native.IsApplication,
+            path => { opened.Add(path); return launchSucceeds; });
+        await using var engine = new EngineClient();
+        var island = new IslandWindow(engine, true, language == "zh-Hans", animationOverride: motion, desktopApplications: apps)
+            { IsHitTestVisible = false, ShowActivated = false };
+        var ui = UiText.For(language == "zh-Hans");
+        try
+        {
+            island.Show();
+            await engine.StartAsync(Path.Combine(AppContext.BaseDirectory, "Engine/PacerEngine.exe"), true, language, referenceFixture: true);
+            island.Reveal(); await island.SynchronizeExpansionAsync(); await island.WaitForPresentationAsync(); await Pump();
+            var buttons = (StackPanel)island.FindName("AppButtons");
+            var harness = buttons.Children.OfType<Button>().Single();
+            Check(AutomationProperties.GetAutomationId(harness) == "island.open.deepseek"
+                && new ButtonAutomationPeer(harness).GetName() == ui.Text("windows.open.deepseek"),
+                "The toolbar needs the localized desktop action");
+            CheckLaunchIcon(harness.Content, harness.Foreground, 17);
+            if (language == "en" && !motion)
+            {
+                var outlineSources = new HashSet<ImageSource>();
+                foreach (string provider in new[] { "codex", "claude", "deepseek", "workbuddy" })
+                {
+                    var source = ProviderIcon.Source(provider, outline: true) as BitmapSource
+                        ?? throw new InvalidOperationException("Missing launch icon for " + provider);
+                    var rgba = new FormatConvertedBitmap(source, PixelFormats.Bgra32, null, 0);
+                    int stride = rgba.PixelWidth * 4;
+                    var pixels = new byte[stride * rgba.PixelHeight];
+                    rgba.CopyPixels(pixels, stride, 0);
+                    int solid = 0, transparent = 0;
+                    for (int i = 3; i < pixels.Length; i += 4)
+                    {
+                        if (pixels[i] >= 224) solid++;
+                        if (pixels[i] == 0) transparent++;
+                    }
+                    int area = rgba.PixelWidth * rgba.PixelHeight;
+                    Check(outlineSources.Add(source) && !ReferenceEquals(source, ProviderIcon.Source(provider)) &&
+                        solid > area * 0.03 && transparent > area * 0.70 && pixels[3] == 0 && pixels[^1] == 0,
+                        "Each app needs its own transparent line artwork with open space around the strokes");
+                }
+                island.ApplyPreferences(new() { IslandAppearance = "liquidGlassLight" });
+                await island.WaitForPresentationAsync(); await Pump();
+                CheckLaunchIcon(harness.Content, PacerPalette.Secondary, 17);
+                island.CapturePreview(Path.Combine(output, "harness-launch-outline-light.png"));
+                island.ApplyPreferences(new() { IslandAppearance = "classic" });
+                await island.WaitForPresentationAsync(); await Pump();
+                CheckLaunchIcon(harness.Content, PacerPalette.Secondary, 17);
+                island.CapturePreview(Path.Combine(output, "harness-launch-outline-dark.png"));
+            }
+            var unbacked = Descendants(island).OfType<TaskRow>().Where(row => State(row).Provider != "deepseek" &&
+                row.IsEnabled != (engine.LatestSnapshot!.ActivityLinks?.Any(link => link.ActivityID == State(row).Id && link.Provider == State(row).Provider) == true))
+                .Select(row => State(row).Provider + (row.IsEnabled ? " enabled" : " disabled")).ToArray();
+            Check(unbacked.Length == 0, "Conversation actions must be backed by the engine's current source-scoped links: " + string.Join(", ", unbacked));
+            await PresentationWait.CommandSnapshotAsync(engine, "configure", new { enabledProviders = new[] { "deepseek" } });
+            await PresentationWait.CommandSnapshotAsync(engine, "demoStage", new { demoStage = 3 }); await island.WaitForPresentationAsync();
+            await Until(() => ((Grid)island.FindName("TaskPages")).Children.Count == 1, "A replaced page must release its outgoing visual");
+            var row = Descendants(island).OfType<TaskRow>().Single(); var value = State(row);
+            Check(value.Unread && value.Phase == "completed" && row.IsEnabled && row.Focusable && row.ActualHeight == 54,
+                "A completed Harness row must retain its native height and support keyboard activation");
+            var peer = UIElementAutomationPeer.CreatePeerForElement(row);
+            Check(peer.GetAutomationControlType() == AutomationControlType.Button && peer.GetChildren()?.Count is null or 0
+                && peer.GetName().Contains(value.Title) && row.ToolTip == null && System.Windows.Automation.AutomationProperties.GetHelpText(row).Contains(ui.Text("common.open_chat")),
+                "The row must expose one named button and its original open help");
+            island.ApplyPreferences(new() { IslandAppearance = "classic", ShowAppButtons = false });
+            Check(buttons.Visibility == Visibility.Collapsed && row.IsEnabled, "Hiding app buttons cannot disable task navigation");
+            Invoke(harness); await Pump(); Check(opened.Count == 0, "A cached toolbar button cannot bypass the hidden-app-button preference");
+            if (language == "en" && !motion)
+            {
+                var more = (Button)island.FindName("MoreButton");
+                Invoke(more);
+                await Until(() => more.ContextMenu.IsOpen, "More must show its application menu");
+                var menuApp = more.ContextMenu.Items.OfType<MenuItem>()
+                    .Single(item => AutomationProperties.GetAutomationId(item) == "island.menu.open.deepseek");
+                menuApp.ApplyTemplate();
+                Check(menuApp.Template.FindName("MenuIcon", menuApp) is ContentPresenter presenter &&
+                    presenter.IsVisible && ReferenceEquals(presenter.Content, menuApp.Icon),
+                    "The application's menu entry must display its launch icon");
+                CheckLaunchIcon(menuApp.Icon, menuApp.Foreground, 14);
+                more.ContextMenu.IsOpen = false;
+                await Pump();
+            }
+            Hover(row, true);
+            Check(motion ? row.HasAnimatedProperties : row.HoverProgress == 1 && !row.HasAnimatedProperties,
+                "Hover must use the native finite clock or settle immediately under reduced motion");
+            await Until(() => row.HoverProgress == 1 && !row.HasAnimatedProperties, "The 120 ms hover must release its animation clock");
+            Check(ReferenceEquals(row.Background, PacerPalette.Hover)
+                && Descendants(row).OfType<Border>().Any(border => border.CornerRadius == new CornerRadius(12)),
+                "Hover must retain the native palette and 12-point row surface");
+            island.CapturePreview(Path.Combine(output, "harness-row-" + language + (motion ? "-motion" : "-reduced") + ".png"));
+            Hover(row, false); row.SetAnimations(false);
+            Check(row.HoverProgress == 0 && !row.HasAnimatedProperties, "Enabling reduced motion must cancel an in-flight hover");
+            Hover(row, true); Check(row.HoverProgress == 1 && !row.HasAnimatedProperties, "Reduced hover cannot retain an idle animation");
+            Hover(row, false); row.SetAnimations(motion);
+
+            var errorClock = Stopwatch.StartNew();
+            Invoke(row); await Until(() => opened.Count == 1, "A task click must reach the shared launcher"); await Pump();
+            Check(opened.Single() == fixture && island.LogicalTarget.Height > 36
+                && engine.LatestSnapshot!.Presentation!.Rows.Single().Unread, "Failed opens must leave the panel and unread completion intact");
+            var status = (TextBlock)island.FindName("StatusLabel");
+            await Until(() => engine.LatestSnapshot?.NavigationError != null && status.Visibility == Visibility.Visible && row.IsEnabled,
+                "A failed launch must publish its shared error and release the single flight before checking the message");
+            Check(status.Text == ui.Text("windows.app.open_failed"), "A launch failure cannot be mislabeled as a missing installation");
+            if (language == "en" && !motion)
+            {
+                await Until(() => status.Visibility == Visibility.Collapsed, "The original error lifetime must clear a failed-open message",
+                    TimeSpan.FromSeconds(NativeTaskRowTiming.Shared.NavigationErrorDuration + 5));
+                Check(errorClock.Elapsed.TotalSeconds >= NativeTaskRowTiming.Shared.NavigationErrorDuration - 1
+                    && engine.LatestSnapshot!.Presentation!.Rows.Single().Unread,
+                    $"Error expiry must retain the unread completion: elapsed={errorClock.Elapsed.TotalSeconds:0.00}, required={NativeTaskRowTiming.Shared.NavigationErrorDuration - 1}, unread={engine.LatestSnapshot!.Presentation!.Rows.Single().Unread}");
+            }
+            launchSucceeds = true;
+            await Until(() => row.IsEnabled, "A failed open must release its shared single flight before another explicit click");
+            Invoke(row);
+            await Until(() => !engine.LatestSnapshot!.Presentation!.Rows.Any(item => item.Id == value.Id && item.Unread) && island.LogicalTarget.Height == 36,
+                "A successful open must acknowledge only that completion before collapsing");
+            await island.WaitForPresentationAsync();
+            Check(opened.Count == 2 && status.Visibility == Visibility.Collapsed, "The successful row action must open once and remove an old failure");
+            Invoke(row); await Pump();
+            Check(opened.Count == 2, "A cached UI Automation row cannot launch while its panel is collapsed");
+
+            island.Reveal(); await island.SynchronizeExpansionAsync(); await island.WaitForPresentationAsync(); await Pump();
+            launchSucceeds = true; island.ApplyPreferences(new() { IslandAppearance = "classic" });
+            var currentHarness = buttons.Children.OfType<Button>().Single();
+            Invoke(currentHarness); await Until(() => opened.Count == 3, "The toolbar must use the same launcher");
+            await island.WaitForPresentationAsync();
+            Check(!engine.LatestSnapshot!.Presentation!.Rows.Any(item => item.Id == value.Id && item.Unread) && island.LogicalTarget.Height == 36,
+                "Opening the desktop alone must collapse the panel without manufacturing an unread event");
+            Invoke(currentHarness); await Pump(); Check(opened.Count == 3, "A cached toolbar button cannot launch while its panel is collapsed");
+            island.Reveal(); await island.SynchronizeExpansionAsync(); await island.WaitForPresentationAsync(); await Pump();
+            await PresentationWait.CommandSnapshotAsync(engine, "demoStage", new { demoStage = 0 }); await island.WaitForPresentationAsync();
+            await Until(() => ((Grid)island.FindName("TaskPages")).Children.Count == 1, "The new running page must finish replacing the completion page");
+            Invoke(row); await Pump();
+            Check(opened.Count == 3, "A cached row from a replaced page cannot act on the new task while the panel is open");
+            installed = false;
+            Check(!apps.Open("deepseek"), "Fresh revalidation must detect the missing installation");
+            island.ApplyPreferences(new() { IslandAppearance = "classic", ShowAppButtons = false });
+            var missingRow = Descendants(island).OfType<TaskRow>().Single();
+            Check(!missingRow.IsEnabled && !missingRow.Focusable && missingRow.ToolTip == null && System.Windows.Automation.AutomationProperties.GetHelpText(missingRow) == ui.Text("activity.no_link") && buttons.Children.Count == 0,
+                "A missing app must disable its row and remove the toolbar action on refresh");
+            Hover(missingRow, true);
+            Check(missingRow.HoverProgress == 0 && !missingRow.HasAnimatedProperties && opened.Count == 3,
+                "A disabled row cannot animate an available-action surface or launch a candidate");
+            Console.WriteLine("PASS Harness navigation " + language + (motion ? "-motion" : "-reduced") +
+                ": transparent launch icons, localized actions, row timing, UIA and acknowledged opens");
+        }
+        finally { island.StopPresentation(); island.AllowClose = true; island.Close(); }
+    }
+    private static EngineTaskRow State(TaskRow row) => ((TaskRowState)row.DataContext).Value;
+    private static void CheckLaunchIcon(object? content, Brush ink, double size) =>
+        Check(content is Border { OpacityMask: ImageBrush mask } outline &&
+            ReferenceEquals(mask.ImageSource, ProviderIcon.Source("deepseek", outline: true)) &&
+            ReferenceEquals(outline.Background, ink) && outline.Width == size && outline.Height == size &&
+            !outline.IsHitTestVisible, "The launch action needs its generated icon in the current foreground color");
+    private static void Hover(TaskRow row, bool inside) => row.RaiseEvent(new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount)
+        { RoutedEvent = inside ? Mouse.MouseEnterEvent : Mouse.MouseLeaveEvent });
+    private static void Invoke(Button button)
+    {
+        try { ((IInvokeProvider)UIElementAutomationPeer.CreatePeerForElement(button).GetPattern(PatternInterface.Invoke)).Invoke(); }
+        catch (ElementNotEnabledException)
+        {
+            Check(!button.IsEnabled, "UI Automation may reject a retired disabled row without dispatching its old action");
+        }
+    }
+    private static async Task Until(Func<bool> condition, string message, TimeSpan? timeout = null)
+    {
+        var clock = Stopwatch.StartNew(); while (!condition() && clock.Elapsed < (timeout ?? PresentationWait.Limit)) await Task.Delay(20);
+        Check(condition(), message); await Pump();
+    }
+    private static async Task Pump() => await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+    private static void Check(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

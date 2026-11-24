@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a reproducible bug in Codex Pacer
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please check the [user guide](https://github.com/RyanZhangNTU/codex-pacer/blob/main/docs/guide.md#troubleshooting) first.
+        Do not include credentials, account details or private task content in text, logs or screenshots.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Windows
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Codex Pacer version, OS version, and Apple silicon, Intel, x64 or ARM64
+      placeholder: Codex Pacer 4.3.2, macOS 26.1, Apple silicon / Codex Pacer 4.3.2, Windows 11 24H2, x64
+    validations:
+      required: true
+  - type: dropdown
+    id: module
+    attributes:
+      label: Affected modules
+      multiple: true
+      options:
+        - Codex
+        - Claude Code
+        - DeepSeek Harness
+        - Not related to a module
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Task source
+      multiple: true
+      options:
+        - This Mac or PC
+        - SSH host
+        - WSL (Windows)
+        - Codex Remote Control
+        - Claude cloud Projects
+        - Not related to tasks
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest reliable steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Optional. Hide private task titles first; Settings → General → Hide Project Names helps. On Windows, if tasks stopped updating, attach the newest file from %LOCALAPPDATA%\CodexPacer\CrashLogs.

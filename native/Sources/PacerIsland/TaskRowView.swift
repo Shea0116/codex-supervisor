@@ -1,0 +1,252 @@
+import SwiftUI
+import PacerCore
+
+/// Line one names the task and its speed, line two its state and model, so the
+/// trailing column pairs a rate with the model that produced it. The panel's
+/// choices can leave out readings or keep one line with the name and the
+/// speed; a row that needs the user then shows its state there instead.
+struct TaskRowView: View {
+    let presentation: ActivityTaskRowPresentation
+    let group: ActivityTaskGroup?
+    private var activity: SessionActivity { presentation.activity }
+    private var attention: PendingAttentionRequest.Kind? { presentation.attention }
+    private var name: String { presentation.title }
+    private var sourceName: String? { presentation.source }
+    let now: Date
+    let enabled: Bool
+    private var unread: Bool { presentation.unread }
+    let accent: Color
+    private var cost: String? { presentation.cost }
+    var costHelp: String? = nil
+    /// The expanded panel's row style and fields; Overview keeps every reading.
+    var options = ExpandedPanelOptions()
+    let action: () -> Void
+    @State private var hovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// A long title stops widening the panel here; a panel that other rows
+    /// made wider still shows more of it.
+    static let measuredTitleWidth: CGFloat = 200
+    private var phase: ActivityPhase { presentation.phase }
+    private var status: String { presentation.status }
+    private var subagents: Int { presentation.subagents }
+    private var subagentText: String {
+        if activity.claudeCloud != nil { return L10n.text("claude.cloud.workers_help", subagents) }
+        return L10n.text(subagents == 1 ? "activity.subagent_running" : "activity.subagents_running", subagents)
+    }
+    private var rate: OutputEstimate? { presentation.rate }
+    private var turnTime: String? { presentation.turnTime }
+    private var dimmed: Bool { presentation.dimmed }
+    private var modelLabel: String { presentation.model }
+    private var effortLabel: String? { presentation.effort }
+    private var latencyText: String {
+        L10n.text("performance.first_output", activity.firstTokenLatency.map { String(format: "%.1f s", $0) } ?? "—")
+    }
+    private var performanceText: String {
+        let speed = rate.map { String(format: "%.1f t/s", $0.value) } ?? L10n.text("performance.awaiting_usage")
+        // A cloud run's first output is only known when its turn ends.
+        return activity.claudeCloud != nil && phase == .running ? speed : speed + "  ·  " + latencyText
+    }
+    private var color: Color {
+        if attention != nil { return PacerPalette.attention }
+        if activity.turnFailed { return PacerPalette.danger }
+        if activity.codexGoalPause != nil { return PacerPalette.paused }
+        if dimmed { return PacerPalette.secondary }
+        switch phase {
+        case .waitingForInput: return PacerPalette.attention
+        case .interrupted: return PacerPalette.paused
+        case .running, .completed: return activity.provider.tint
+        default: return PacerPalette.secondary
+        }
+    }
+    private var detailColor: Color {
+        if attention != nil || phase == .waitingForInput { return PacerPalette.attention }
+        return activity.turnFailed ? PacerPalette.danger : PacerPalette.secondary
+    }
+    /// A working stage shows its glyph over an orb; a request for the user or
+    /// an ending fills a disc, greyed once read; an unknown state draws a moon.
+    private var face: TaskStatusIconNSView.Face {
+        let symbol = presentation.symbol
+        switch symbol {
+        case .approval, .input, .completed, .interrupted, .failed: return .solid(symbol, read: dimmed)
+        case .unknown: return .plain(symbol)
+        default: return .working(symbol)
+        }
+    }
+    private var progressRing: TaskProgressRing? { presentation.progressRing }
+
+    var body: some View {
+        Button(action: action) {
+            rowContent(measuring: false)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(hovered && enabled ? PacerPalette.hover : .clear))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .background {
+            rowContent(measuring: true).fixedSize(horizontal: true, vertical: false)
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: ExpandedContentIdealWidth.self, value: geometry.size.width)
+                })
+                .hidden().allowsHitTesting(false).accessibilityHidden(true)
+        }
+        .buttonStyle(.plain).disabled(!enabled)
+        .onHover { hovered = $0 }
+        .animation(reduceMotion ? nil : .easeOut(duration: TaskRowInteraction.hoverDuration), value: hovered)
+        .accessibilityLabel(accessibilityText)
+        .accessibilityHint(accessibilityHint)
+    }
+
+    private var accessibilityHint: String {
+        return [enabled ? openHelp : L10n.text("activity.no_link"), costHelp].compactMap { $0 }.joined(separator: " ")
+    }
+
+    private var accessibilityText: String {
+        let state = [unread ? L10n.text("common.not_viewed") : nil, status, progressRing?.accessibilityText, turnTime,
+                     subagents > 0 ? subagentText : nil]
+        let model = [modelLabel, effortLabel.map { L10n.text("model.effort_help", $0) }].compactMap { $0 }.joined(separator: " ")
+        return activity.provider.displayName + ", " + L10n.text("activity.row_accessibility", name,
+            state.compactMap { $0 }.joined(separator: ", "), sourceName ?? L10n.text("common.local")) + ", " + model + (activity.claudeCloud == nil || rate != nil ? ", " + performanceText : "")
+            + (presentation.costAccessibility.map { ", " + $0 } ?? "")
+    }
+
+    /// Rows of one line are this tall; two-line rows take 54 points.
+    static func height(_ style: ExpandedPanelOptions.RowStyle) -> CGFloat { style == .oneLine ? 38 : 54 }
+    private var oneLine: Bool { options.rowStyle == .oneLine }
+    private var showsRateLine: Bool { options.shows(.rate) || (options.shows(.turnTime) && turnTime != nil) }
+    private var showsModelLine: Bool { options.shows(.model) || (options.shows(.cost) && cost != nil) }
+    /// A request for the user, a wait for an answer or a failure replaces the
+    /// readings in a one-line row.
+    private var statusLeads: Bool { attention != nil || phase == .waitingForInput || activity.turnFailed }
+
+    @ViewBuilder private func rowContent(measuring: Bool) -> some View {
+        if oneLine {
+            HStack(spacing: 8) {
+                statusIcon(measuring: measuring)
+                title(measuring: measuring)
+                if statusLeads {
+                    Text(status).font(.system(size: 11, weight: .medium)).foregroundStyle(detailColor).lineLimit(1).fixedSize()
+                } else if showsRateLine {
+                    rateLine
+                }
+            }
+            .padding(.horizontal, IslandMetrics.rowInset).padding(.vertical, 8)
+        } else {
+            HStack(spacing: 10) {
+                statusIcon(measuring: measuring)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 16) {
+                        title(measuring: measuring)
+                        if showsRateLine { rateLine }
+                    }
+                    HStack(alignment: .firstTextBaseline, spacing: 16) {
+                        statusLine.frame(maxWidth: measuring ? nil : .infinity, alignment: .leading)
+                        if showsModelLine { modelLine }
+                    }
+                }
+            }
+            .padding(.horizontal, IslandMetrics.rowInset).padding(.vertical, 8)
+        }
+    }
+
+    private func title(measuring: Bool) -> some View {
+        Text(name).font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(dimmed ? PacerPalette.secondary : PacerPalette.primary).lineLimit(1)
+            .frame(maxWidth: measuring ? Self.measuredTitleWidth : .infinity, alignment: .leading)
+    }
+
+    /// The ring and the state share one icon, 28 points or 22 in a one-line
+    /// row. The width probe draws nothing, so only the shown row keeps a
+    /// task's motion.
+    @ViewBuilder private func statusIcon(measuring: Bool) -> some View {
+        let full = TaskStatusIconNSView.diameter, side = oneLine ? 22 : full
+        if measuring {
+            Color.clear.frame(width: side, height: side)
+        } else {
+            TaskStatusIconView(id: activity.id, ring: progressRing, face: face, color: color, animates: !reduceMotion,
+                completionPulseOnly: activity.provider == .codex)
+                .frame(width: full, height: full)
+                .scaleEffect(side / full)
+                .frame(width: side, height: side)
+                .accessibilityHidden(true)
+        }
+    }
+
+    /// Local SDK/ACP rows name the app that started their session.
+    private var openHelp: String {
+        if activity.claudeCloud != nil { return L10n.text("claude.cloud.open_help") }
+        if activity.sourceHostID != nil {
+            return L10n.text(activity.provider == .claude ? "claude.open_remote_help" : "common.open_chat")
+        }
+        guard activity.provider == .claude || activity.launchedByEmbeddingApp else { return L10n.text("common.open_chat") }
+        return sourceName.map { L10n.text("claude.open_host_help", $0) } ?? L10n.text("common.open_chat")
+    }
+
+    private var statusLine: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(status).foregroundStyle(detailColor).lineLimit(1).layoutPriority(1)
+            if subagents > 0, options.shows(.subagents) {
+                HStack(spacing: 3) {
+                    Image(systemName: "person.2").font(.system(size: 9, weight: .semibold))
+                    Text(presentation.subagentText).monospacedDigit()
+                }
+                .foregroundStyle(PacerPalette.secondary).fixedSize()
+            }
+            if let source = sourceName, options.shows(.source) {
+                HStack(spacing: 3) {
+                    // Remote hosts get a server glyph; a local app is named as is.
+                    if activity.sourceHostID != nil {
+                        Image(systemName: activity.claudeCloud != nil ? "cloud" : "server.rack").font(.system(size: 9, weight: .semibold))
+                    }
+                    Text(ActivityTaskRowPresentation.middleTruncated(source, limit: 16))
+                }
+                .foregroundStyle(PacerPalette.secondary).lineLimit(1).fixedSize()
+            }
+        }
+        .font(.system(size: 11, weight: .medium))
+    }
+
+    private var rateLine: some View {
+        let showsRate = options.shows(.rate)
+        return HStack(alignment: .firstTextBaseline, spacing: 0) {
+            if showsRate, let rate {
+                Text(presentation.rateText ?? "").font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(rate.isFresh && !dimmed ? PacerPalette.primary : PacerPalette.secondary)
+                Text(" t/s").font(.system(size: 10, weight: .medium)).foregroundStyle(PacerPalette.tertiary)
+            } else if showsRate, activity.claudeCloud == nil {
+                Text(L10n.text("performance.awaiting_usage")).font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(PacerPalette.tertiary)
+            }
+            if let turnTime, options.shows(.turnTime) {
+                if showsRate, rate != nil || activity.claudeCloud == nil {
+                    Text(" · ").font(.system(size: 11, weight: .medium)).foregroundStyle(PacerPalette.tertiary)
+                }
+                Text(turnTime).font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(phase == .running ? PacerPalette.primary.opacity(0.78) : PacerPalette.secondary)
+            }
+        }
+        .monospacedDigit().lineLimit(1).fixedSize()
+    }
+
+    private var modelLine: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            if let cost, options.shows(.cost) {
+                HStack(alignment: .center, spacing: 4) {
+                    if presentation.peakCost {
+                        Circle().fill(PacerPalette.attention).frame(width: 5, height: 5).accessibilityHidden(true)
+                    }
+                    Text(cost).foregroundStyle(PacerPalette.primary.opacity(0.86))
+                }
+                .padding(.trailing, 3)
+            }
+            if options.shows(.model) {
+                Text(modelLabel)
+                if let effortLabel { Text(effortLabel).opacity(0.62) }
+            }
+        }
+        .font(.system(size: 11, weight: .medium)).foregroundStyle(activity.provider.tint)
+        .opacity(dimmed ? 0.7 : 1).lineLimit(1).fixedSize()
+    }
+}
+
+struct ExpandedContentIdealWidth: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
