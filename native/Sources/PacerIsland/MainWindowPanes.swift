@@ -115,6 +115,8 @@ struct OverviewPane: View {
                 if let problem = localTaskProblem(provider), provider != .muse {
                     Text(problem).font(.system(size: 12)).foregroundStyle(MainPalette.attention)
                         .fixedSize(horizontal: false, vertical: true)
+                } else if provider == .antigravity, model.localHarnessStatus(provider) == .idle {
+                    Text(L10n.text("monitoring.idle")).font(.system(size: 12)).foregroundStyle(.secondary)
                 } else if model.localHarnessStatus(provider) == .ready, provider == .grokBot || provider == .antigravity {
                     Text(L10n.text(provider == .grokBot ? "supervisor.grok.online" : "supervisor.antigravity.recent"))
                         .font(.system(size: 12)).foregroundStyle(.secondary)
@@ -134,7 +136,7 @@ struct OverviewPane: View {
         switch model.localHarnessStatus(provider) {
         case .incompatible: L10n.text("harness.incompatible")
         case .unavailable where provider == .grokBot: L10n.text("supervisor.grok.offline")
-        case .unavailable where provider == .antigravity: L10n.text("supervisor.antigravity.inactive")
+        case .unavailable where provider == .antigravity: L10n.text("supervisor.antigravity.read_failed")
         case .unavailable: L10n.text("harness.unavailable")
         case .missing where !model.providerDetected(provider): L10n.text("harness.missing")
         default: nil

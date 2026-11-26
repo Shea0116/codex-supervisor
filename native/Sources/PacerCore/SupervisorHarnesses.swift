@@ -83,7 +83,7 @@ private actor SupervisorHarnessMonitor: LocalHarnessMonitor {
         case .grokBot:
             snapshot = SupervisorLocalEvidence.grok(root: home, files: io.files, now: now)
         case .antigravity:
-            snapshot = SupervisorLocalEvidence.antigravity(root: home, files: io.files, now: now)
+            snapshot = AntigravityEvidence.read(root: home, files: io.files, now: now)
         case .muse:
             snapshot = await MuseQuotaReader.read(home: home, files: io.files, now: now)
         default:
@@ -180,17 +180,5 @@ enum SupervisorLocalEvidence {
             }
         }
         return .init(status: .unavailable)
-    }
-
-    static func antigravity(root: URL, files: any PlatformFileSystem, now: Date) -> HarnessActivity {
-        guard let paths = try? files.entries(in: root.appendingPathComponent("conversations")) else { return .init(status: .missing) }
-        let recent = paths.prefix(512).contains { file in
-            let name = file.lastPathComponent
-            let base = name.hasSuffix(".db-wal") ? String(name.dropLast(4)) : name
-            guard base.hasSuffix(".db"), UUID(uuidString: String(base.dropLast(3))) != nil,
-                  let md = files.metadata(file), md.isRegularFile else { return false }
-            return (0...900).contains(now.timeIntervalSince(md.modified))
-        }
-        return .init(status: recent ? .ready : .unavailable)
     }
 }

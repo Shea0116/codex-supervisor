@@ -580,7 +580,20 @@ final class IslandModel: ObservableObject {
 
     /// A local harness's data folder.
     func harnessMonitoring(_ provider: AgentProvider) -> ModuleMonitoring {
-        .harness(localHarnessStatus(provider), detected: providerDetected(provider), sessions: localRunningSessions(provider))
+        var monitoring = ModuleMonitoring.harness(localHarnessStatus(provider), detected: providerDetected(provider),
+                                                  sessions: localRunningSessions(provider))
+        if provider == .antigravity {
+            switch monitoring.state {
+            case .idle:
+                monitoring.detail = L10n.text("supervisor.antigravity.idle_detail")
+            case .on where monitoring.sessions == 0:
+                monitoring.detail = L10n.text("supervisor.antigravity.recent")
+            case .unreadable:
+                monitoring.detail = L10n.text("supervisor.antigravity.read_failed")
+            default: break
+            }
+        }
+        return monitoring
     }
 
     /// The ChatGPT account Codex is signed in to, as its quota read shows it.

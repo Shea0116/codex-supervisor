@@ -7,10 +7,10 @@ Codex Supervisor 是 macOS 上的 AI 工具监控应用。项目基于 [Codex Pa
 | Codex、Claude Code、DeepSeek Harness、WorkBuddy | 沿用 Pacer 原有的任务和用量接入 |
 | Cursor | 本机 Agent 会话活动和已记录的任务结束状态 |
 | Grok Bot | 本机桌面应用心跳 |
-| Antigravity | 本机会话库的近期写入 |
+| Antigravity | 本机会话的明确运行状态和近期活动 |
 | Muse | 官方 Muse Code CLI 的五小时和每周额度，或带时间的手动读数 |
 
-Cursor 任务沿用原版任务列表。Grok Bot 和 Antigravity 显示在总览。Muse 在总览和灵动岛里使用原版额度环，也可以从设置进入 Muse 服务页。可用服务可以在「设置 → 模块库」查看。
+Cursor 和 Antigravity 的任务活动沿用原版列表，Grok Bot 心跳显示在总览。Muse 在总览和灵动岛里使用原版额度环，也可以从设置进入 Muse 服务页。可用服务可以在「设置 → 模块库」查看。
 
 ## 构建并使用
 

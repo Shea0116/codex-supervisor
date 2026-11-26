@@ -1674,7 +1674,6 @@
 
 "module.cursor.summary" = "本机 Cursor Agent 的任务活动和记录的结束状态。";
 "module.grok-bot.summary" = "本机 Grok Bot 桌面心跳。";
-"module.antigravity.summary" = "本机 Antigravity 会话的近期写入。";
 "module.muse.summary" = "Muse Code 订阅额度，或带时间的手动读数。";
 "welcome.module.cursor_missing" = "未找到 Cursor";
 "welcome.module.grok-bot_missing" = "未找到 Grok Bot";
@@ -1684,9 +1683,12 @@
 "muse.quota.source.cli" = "Muse Code CLI";
 "muse.quota.source.manual" = "Muse 手动读数";
 "supervisor.grok.offline" = "暂无近期桌面心跳";
-"supervisor.antigravity.inactive" = "暂无本机会话更新";
 "supervisor.grok.online" = "已收到桌面心跳";
 "supervisor.antigravity.recent" = "检测到近期会话活动";
 "muse.quota.source.demo" = "演示读数";
 "panel.block.muse" = "Muse";
 "panel.block_detail.muse" = "Muse 五小时与每周额度";
+"monitoring.idle" = "暂无近期活动";
+"supervisor.antigravity.idle_detail" = "本机会话数据可读。有新任务时会自动更新。";
+"supervisor.antigravity.read_failed" = "无法读取 Antigravity 本机会话数据。请检查数据文件夹后重新检测。";
+"module.antigravity.summary" = "本机 Antigravity 会话的运行状态和近期活动。";

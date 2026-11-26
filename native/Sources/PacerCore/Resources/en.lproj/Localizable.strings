@@ -1674,7 +1674,6 @@
 
 "module.cursor.summary" = "Local Cursor Agent turns and their recorded outcomes.";
 "module.grok-bot.summary" = "Local Grok Bot desktop heartbeat.";
-"module.antigravity.summary" = "Recent writes to local Antigravity conversations.";
 "module.muse.summary" = "Muse Code subscription usage, or a dated manual reading.";
 "welcome.module.cursor_missing" = "Cursor not found";
 "welcome.module.grok-bot_missing" = "Grok Bot not found";
@@ -1684,9 +1683,12 @@
 "muse.quota.source.cli" = "Muse Code CLI";
 "muse.quota.source.manual" = "Manual Muse reading";
 "supervisor.grok.offline" = "No recent desktop heartbeat";
-"supervisor.antigravity.inactive" = "No recent local conversation updates";
 "supervisor.grok.online" = "Desktop heartbeat received";
 "supervisor.antigravity.recent" = "Recent conversation activity";
 "muse.quota.source.demo" = "Demo reading";
 "panel.block.muse" = "Muse";
 "panel.block_detail.muse" = "Five-hour and weekly Muse allowance";
+"monitoring.idle" = "No recent activity";
+"supervisor.antigravity.idle_detail" = "Local conversation data is readable. Recent tasks will appear automatically.";
+"supervisor.antigravity.read_failed" = "Could not read local Antigravity conversations. Check the data folder and rescan.";
+"module.antigravity.summary" = "Active tasks and recent writes from local Antigravity conversations.";

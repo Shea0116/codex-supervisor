@@ -5,7 +5,7 @@ import Foundation
 /// actions, so the pages read alike; only what feeds them differs.
 public struct ModuleMonitoring: Equatable, Sendable {
     public enum State: String, Equatable, Sendable {
-        case on, checking, settingUp, waiting, needsApproval, needsUpdate, silent, failed, notFound, unreadable
+        case on, idle, checking, settingUp, waiting, needsApproval, needsUpdate, silent, failed, notFound, unreadable
     }
     public enum Tone: String, Equatable, Sendable { case positive, neutral, attention }
     /// At most one button per row.
@@ -32,7 +32,7 @@ public struct ModuleMonitoring: Equatable, Sendable {
     public var tone: Tone {
         switch state {
         case .on: .positive
-        case .checking, .settingUp, .waiting: .neutral
+        case .idle, .checking, .settingUp, .waiting: .neutral
         case .needsApproval, .needsUpdate, .silent, .failed, .notFound, .unreadable: .attention
         }
     }
@@ -59,6 +59,7 @@ public struct ModuleMonitoring: Equatable, Sendable {
     private static func key(_ state: State) -> String {
         switch state {
         case .on: "on"
+        case .idle: "idle"
         case .checking: "checking"
         case .settingUp: "setting_up"
         case .waiting: "waiting"
@@ -109,6 +110,7 @@ public struct ModuleMonitoring: Equatable, Sendable {
     public static func harness(_ status: HarnessSourceStatus?, detected: Bool, sessions: Int) -> Self {
         switch status {
         case .ready?: .init(.on, sessions: sessions)
+        case .idle?: .init(.idle, action: .rescan)
         // Installed without task data yet is no problem; not installed is.
         case .missing?: detected ? .init(.waiting, detail: L10n.text("harness.missing"), action: .rescan) : .init(.notFound, action: .rescan)
         case .incompatible?: .init(.unreadable, detail: L10n.text("harness.incompatible"), action: .rescan)

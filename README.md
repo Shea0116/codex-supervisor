@@ -7,10 +7,10 @@ A macOS monitor for AI agents using the original SwiftUI and AppKit interface fr
 | Codex, Claude Code, DeepSeek Harness and WorkBuddy | The upstream task and usage integrations |
 | Cursor | Local Agent transcript activity and explicit turn outcomes |
 | Grok Bot | Local desktop heartbeat |
-| Antigravity | Recent writes to local conversation databases |
+| Antigravity | Explicit running states and recent local conversation activity |
 | Muse | Five-hour and weekly Muse Code subscription allowance from the official CLI, or a dated manual reading |
 
-Grok Bot and Antigravity signals appear in Overview. Cursor turns appear in the original task list. Muse uses the same quota rings as Codex and Claude, including the Island and Overview. Settings → Module Library shows which integrations are available.
+Desktop activity appears in Overview. Cursor and Antigravity tasks appear in the original task list when their local sources identify them. Muse uses the same quota rings as Codex and Claude, including the Island and Overview. Settings → Module Library shows which integrations are available.
 
 ## Build and run
 

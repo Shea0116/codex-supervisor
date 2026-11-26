@@ -35,7 +35,7 @@ public struct HarnessDailyAmount: Codable, Equatable, Sendable {
 }
 
 public enum HarnessSourceStatus: String, Equatable, Sendable {
-    case ready, missing, incompatible, unavailable
+    case ready, idle, missing, incompatible, unavailable
 }
 
 /// A module can use several transports behind one activity adapter.
